@@ -1,65 +1,65 @@
-import querystring from "querystring";
+export const config = {
+  runtime: "edge",
+};
 
-export default async function handler(req, res) {
-  if (req.method !== "POST") return res.status(405).send("Method not allowed");
-
-  // Slack sends form-encoded data, not JSON
-  let body = req.body;
-  if (typeof body === "string") {
-    body = querystring.parse(body);
+export default async function handler(req) {
+  if (req.method !== "POST") {
+    return new Response("Method not allowed", { status: 405 });
   }
 
-  const { user_name, response_url } = body;
+  // Parse Slack form-encoded body
+  const text = await req.text();
+  const params = new URLSearchParams(text);
+  const user_name = params.get("user_name") || "user";
+  const response_url = params.get("response_url") || "";
 
-  // Immediately acknowledge Slack (must respond within 3 seconds)
-  res.status(200).json({
-    response_type: "in_channel",
-    text: `*BHEL Appointment Bot started!* :rocket:\nTriggered by @${user_name || "user"}\nI'll send an OTP prompt here shortly. Stand by...`,
-  });
-
-  // Trigger GitHub Actions workflow_dispatch
-  try {
-    const ghRes = await fetch(
-      `https://api.github.com/repos/${process.env.GITHUB_REPO}/actions/workflows/book.yml/dispatches`,
-      {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${process.env.GITHUB_TOKEN}`,
-          Accept: "application/vnd.github+json",
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          ref: "main",
-          inputs: {
-            response_url: response_url || "",
-            triggered_by: user_name || "user",
-          },
-        }),
-      }
-    );
-
-    if (!ghRes.ok) {
-      const err = await ghRes.text();
-      console.error("GitHub Actions trigger failed:", err);
-      await notifySlack(response_url, `:x: Failed to start bot: ${err}`);
-    } else {
-      console.log("GitHub Actions triggered successfully");
-    }
-  } catch (e) {
-    console.error("Error:", e.message);
-    await notifySlack(response_url, `:x: Error: ${e.message}`);
-  }
-}
-
-async function notifySlack(url, text) {
-  if (!url) return;
-  try {
-    await fetch(url, {
-      method: "POST",
+  // Immediately respond to Slack (within 3 seconds)
+  const slackResponse = new Response(
+    JSON.stringify({
+      response_type: "in_channel",
+      text: `*BHEL Appointment Bot started!* :rocket:\nTriggered by @${user_name}\nI'll send an OTP prompt here shortly. Stand by...`,
+    }),
+    {
+      status: 200,
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ text }),
-    });
-  } catch (e) {
-    console.error("Slack notify error:", e.message);
-  }
+    }
+  );
+
+  // Trigger GitHub Actions in background
+  const githubUrl = `https://api.github.com/repos/${process.env.GITHUB_REPO}/actions/workflows/book.yml/dispatches`;
+
+  fetch(githubUrl, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${process.env.GITHUB_TOKEN}`,
+      Accept: "application/vnd.github+json",
+      "Content-Type": "application/json",
+      "User-Agent": "bhel-booking-bot",
+    },
+    body: JSON.stringify({
+      ref: "main",
+      inputs: {
+        response_url: response_url,
+        triggered_by: user_name,
+      },
+    }),
+  })
+    .then(async (res) => {
+      if (!res.ok) {
+        const err = await res.text();
+        console.error("GitHub trigger failed:", err);
+        if (response_url) {
+          await fetch(response_url, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ text: `:x: Failed to start bot: ${err}` }),
+          });
+        }
+      } else {
+        console.log("GitHub Actions triggered OK");
+      }
+    })
+    .catch((e) => console.error("Fetch error:", e.message));
+
+  return slackResponse;
 }
