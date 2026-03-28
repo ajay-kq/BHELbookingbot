@@ -4,7 +4,7 @@ BHEL KarExpert — Final Booking Bot
 Start  : Manual /start from Slack at 6:25 AM
 OTP    : /otp command → Slack asks → you type 6 digits → Enter
 Poll   : Every 30 seconds on last (7th) date tab
-Stop   : Auto-stops at 7:20 AM or when booking confirmed
+Stop   : Auto-stops at 7:10 AM IST or when booking confirmed
 Slots  : Any available slot (not gray, not cursor:not-allowed)
 """
 
@@ -24,8 +24,8 @@ LOGIN_URL          = "https://bhel.karexpert.com/account-management/login"
 BOOKING_URL        = "https://bhel.karexpert.com/appointment/searchdoctor/searchdepartment/general/cleardate"
 
 POLL_INTERVAL_SEC  = 30      # poll every 30 seconds
-STOP_HOUR          = 7       # auto-stop hour
-STOP_MIN           = 20      # auto-stop minute (7:20 AM)
+STOP_HOUR          = 7       # auto-stop hour IST
+STOP_MIN           = 10      # auto-stop minute (7:10 AM IST)
 OTP_POLL_SEC       = 3
 OTP_TIMEOUT_SEC    = 120
 
@@ -52,9 +52,25 @@ def slack(text, emoji=""):
                 continue
     log(f"[SLACK] {msg[:80]}")
 
+def get_ist_time():
+    """Get current time in IST (UTC+5:30)."""
+    from datetime import timezone, timedelta
+    utc_now = datetime.now(timezone.utc)
+    ist_offset = timedelta(hours=5, minutes=30)
+    return utc_now + ist_offset
+
 def past_stop_time():
-    now = datetime.now()
-    return now.hour > STOP_HOUR or (now.hour == STOP_HOUR and now.minute >= STOP_MIN)
+    """Check if past 7:10 AM IST."""
+    ist = get_ist_time()
+    ist_hour   = ist.hour
+    ist_minute = ist.minute
+    log(f"IST time: {ist.strftime('%H:%M:%S')} | Stop at: 07:10 IST")
+    # Stop after 7:10 AM IST
+    if ist_hour > 7:
+        return True
+    if ist_hour == 7 and ist_minute >= 10:
+        return True
+    return False
 
 def clear_otp():
     if not GITHUB_TOKEN or not GITHUB_REPO:
@@ -151,10 +167,12 @@ def run():
 
     mobile = get_mobile()
     log(f"Bot starting | Mobile: {mobile[:3]}XXXXXXX | DRY_RUN: {DRY_RUN}")
+    ist = get_ist_time()
     slack(
         f"*Bot started!* :rocket:\n"
         f"Opening portal for *Dr S {DOCTOR_SEARCH}*\n"
-        f"Will poll every *{POLL_INTERVAL_SEC}s* until *7:20 AM*",
+        f"IST time now: *{ist.strftime('%H:%M:%S')}*\n"
+        f"Will poll every *{POLL_INTERVAL_SEC}s* until *7:10 AM IST*",
         ":robot_face:"
     )
 
@@ -299,13 +317,36 @@ def run():
             except Exception:
                 continue
         page.wait_for_load_state("networkidle", timeout=20000)
+        time.sleep(3)  # Extra wait for Angular session to establish
+
+        # Verify we are actually logged in (not redirected back to login)
+        current_url = page.url
+        log(f"Post-login URL: {current_url}")
+        if "login" in current_url.lower():
+            log("Still on login page — waiting more ...")
+            time.sleep(3)
+            page.wait_for_load_state("networkidle", timeout=10000)
+            current_url = page.url
+            log(f"URL after extra wait: {current_url}")
+            if "login" in current_url.lower():
+                slack(":x: Login failed — still on login page. Check mobile/OTP and try `/start` again.")
+                raise Exception("Login redirect — session not established")
+
         slack(":white_check_mark: *Logged in!* Navigating to booking page...")
         log("Logged in!")
 
         # ── STEP 8: Go to booking page ────────────────────────────────────────
         log("Navigating to booking page ...")
         page.goto(BOOKING_URL, wait_until="networkidle", timeout=30000)
-        time.sleep(3)
+        time.sleep(5)  # Angular needs time to render doctor list
+
+        # Check if redirected to login again
+        booking_current_url = page.url
+        log(f"Booking page URL: {booking_current_url}")
+        if "login" in booking_current_url.lower():
+            log("Redirected to login on booking page — session issue")
+            slack(":x: Session expired navigating to booking page. Type `/start` to retry.")
+            raise Exception("Session expired — redirected to login")
 
         # Wait for page to fully render — try multiple indicators
         for selector in [
@@ -313,6 +354,7 @@ def run():
             "kx-search-doctor-list",
             "div#doctor-card",
             "._wf-pp-maindiv",
+            "._pp-main-container",
         ]:
             try:
                 page.wait_for_selector(selector, timeout=8000)
@@ -433,11 +475,11 @@ def run():
         slack(
             f":mag: *Watching for slots every {POLL_INTERVAL_SEC} seconds*\n"
             f"Checking last date tab only\n"
-            f"Bot auto-stops at *7:20 AM*\n"
+            f"Bot auto-stops at *7:10 AM IST*\n"
             f"I'll book the first available slot immediately!", ":clock630:"
         )
 
-        # ── STEP 11: Poll every 30 seconds until 7:20 AM ─────────────────────
+        # ── STEP 11: Poll every 30 seconds until 7:10 AM IST ────────────────────
         attempt = 0
         while True:
             attempt += 1
@@ -445,12 +487,12 @@ def run():
             # Check stop time
             if past_stop_time():
                 slack(
-                    ":stopwatch: *7:20 AM reached — bot stopping.*\n"
+                    ":stopwatch: *7:10 AM IST reached — bot stopping.*\n"
                     "No slot was found today.\n"
                     "Type `/start` tomorrow at 6:25 AM to try again.",
                     ":x:"
                 )
-                log("7:20 AM — stopping")
+                log("7:10 AM IST — stopping")
                 break
 
             log(f"── Attempt {attempt} | {datetime.now().strftime('%H:%M:%S')} ──")
