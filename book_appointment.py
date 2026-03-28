@@ -303,53 +303,127 @@ def run():
         log("Logged in!")
 
         # ── STEP 8: Go to booking page ────────────────────────────────────────
-        log(f"Navigating to booking page ...")
+        log("Navigating to booking page ...")
         page.goto(BOOKING_URL, wait_until="networkidle", timeout=30000)
         time.sleep(3)
+
+        # Wait for page to fully render — try multiple indicators
+        for selector in [
+            'input[placeholder="Search Doctor"]',
+            "kx-search-doctor-list",
+            "div#doctor-card",
+            "._wf-pp-maindiv",
+        ]:
+            try:
+                page.wait_for_selector(selector, timeout=8000)
+                log(f"Page ready — found: {selector}")
+                break
+            except Exception:
+                continue
+        time.sleep(2)
         log("Booking page loaded")
 
-        # ── STEP 9: Search for Dr Kamal Kumar ────────────────────────────────
+        # ── STEP 9: Search for Dr Kamal Kumar ─────────────────────────────────
         log(f"Searching: {DOCTOR_SEARCH} ...")
+        search_done = False
+
+        # Try search box
+        for attempt in range(3):
+            try:
+                search = page.locator('input[placeholder="Search Doctor"]')
+                if search.is_visible(timeout=5000):
+                    search.click()
+                    search.fill(DOCTOR_SEARCH)
+                    time.sleep(2)
+                    search_done = True
+                    log("Search filled")
+                    break
+            except Exception as e:
+                log(f"Search attempt {attempt+1}: {e}")
+                time.sleep(2)
+
+        if not search_done:
+            log("Search box not found — doctor list may already be showing")
+
+        # Wait for doctor cards
         try:
-            page.wait_for_selector('input[placeholder="Search Doctor"]', timeout=15000)
-            search = page.locator('input[placeholder="Search Doctor"]')
-            search.click()
-            search.fill(DOCTOR_SEARCH)
-            time.sleep(2)
-            page.wait_for_selector("div#doctor-card", timeout=10000)
-            log("Doctor cards loaded")
-        except Exception as e:
-            log(f"Search: {e}")
+            page.wait_for_selector("div#doctor-card", timeout=15000)
+            time.sleep(1)
+            log("Doctor cards visible")
+        except Exception:
+            log("Doctor cards timeout — trying anyway")
 
         # ── STEP 10: Click Book Appointment on Dr Kamal Kumar's card ──────────
         log("Finding Dr S Kamal Kumar ...")
-        try:
-            cards = page.locator("div#doctor-card")
-            total = cards.count()
-            log(f"Found {total} doctor cards")
-            found_doctor = False
-            for i in range(total):
-                card = cards.nth(i)
-                try:
-                    card_text = card.inner_text() or ""
-                    if "Kamal" in card_text:
-                        log(f"Dr Kamal Kumar at card {i+1}")
-                        card.scroll_into_view_if_needed()
-                        time.sleep(0.5)
-                        btn = card.locator("button.primary-btn").first
-                        btn.wait_for(state="visible", timeout=5000)
-                        btn.click()
-                        found_doctor = True
-                        log("Clicked Book Appointment on Dr Kamal Kumar!")
-                        break
-                except Exception as e:
-                    log(f"Card {i+1}: {e}")
-            if not found_doctor:
-                log("Fallback: clicking first primary-btn ...")
-                page.locator("button.primary-btn").first.click()
-        except Exception as e:
-            slack(f":x: Could not find Dr Kamal Kumar: {e}")
-            raise
+        found_doctor = False
+
+        # Try multiple card selectors
+        for card_selector in ["div#doctor-card", "div._wf-pp-divforcard", "kx-search-doctor-list .ng-star-inserted"]:
+            try:
+                cards = page.locator(card_selector)
+                total = cards.count()
+                log(f"Selector '{card_selector}': {total} cards")
+
+                if total == 0:
+                    continue
+
+                for i in range(total):
+                    card = cards.nth(i)
+                    try:
+                        card_text = card.inner_text() or ""
+                        if "Kamal" in card_text or DOCTOR_SEARCH.split()[0] in card_text:
+                            log(f"Found Dr Kamal Kumar at card {i+1}")
+                            card.scroll_into_view_if_needed()
+                            time.sleep(0.5)
+                            # Try primary-btn first
+                            for btn_sel in ["button.primary-btn", "button.primary-btn.disabledBookBtn", "button[class*='primary']"]:
+                                try:
+                                    btn = card.locator(btn_sel).first
+                                    if btn.is_visible(timeout=3000):
+                                        btn.click()
+                                        found_doctor = True
+                                        log(f"Clicked via {btn_sel}")
+                                        break
+                                except Exception:
+                                    continue
+                            if found_doctor:
+                                break
+                    except Exception as e:
+                        log(f"Card {i+1}: {e}")
+
+                if found_doctor:
+                    break
+            except Exception as e:
+                log(f"Card selector '{card_selector}': {e}")
+
+        if not found_doctor:
+            # Last resort: take a screenshot hint and click first visible primary-btn
+            log("Last resort: clicking first visible primary-btn on page ...")
+            try:
+                btns = page.locator("button.primary-btn")
+                count = btns.count()
+                log(f"Found {count} primary-btn buttons total")
+                for i in range(count):
+                    try:
+                        btn = btns.nth(i)
+                        if btn.is_visible(timeout=2000):
+                            btn_text = btn.inner_text().strip()
+                            log(f"Button {i+1}: '{btn_text}'")
+                            if "Book" in btn_text or "Appointment" in btn_text:
+                                btn.click()
+                                found_doctor = True
+                                log(f"Clicked button: '{btn_text}'")
+                                break
+                    except Exception:
+                        continue
+                if not found_doctor and count > 0:
+                    btns.first.click()
+                    found_doctor = True
+                    log("Clicked first primary-btn")
+            except Exception as e:
+                slack(f":x: Cannot find Book Appointment button: {e}")
+                raise Exception(f"Book button not found: {e}")
+
         time.sleep(2)
 
         # Save doctor slot page URL for polling
