@@ -1,34 +1,43 @@
 """
-BHEL KarExpert — Booking Bot (Slack + GitHub Actions mode)
-Login flow: Click "Login With OTP" → enter 10-digit mobile → Next → enter OTP digits → Login
+BHEL KarExpert — Final Booking Bot
+===================================
+Start  : Manual /start from Slack at 6:25 AM
+OTP    : /otp command → Slack asks → you type 6 digits → Enter
+Poll   : Every 30 seconds on last (7th) date tab
+Stop   : Auto-stops at 7:20 AM or when booking confirmed
+Slots  : Any available slot (not gray, not cursor:not-allowed)
 """
 
 import os, time, requests, traceback
 from datetime import datetime
 
+# ── Config ────────────────────────────────────────────────────────────────────
 MOBILE             = os.environ["MOBILE"]
 DOCTOR_SEARCH      = os.environ.get("DOCTOR_SEARCH", "Kamal Kumar")
 SLACK_WEBHOOK      = os.environ.get("SLACK_WEBHOOK", "")
 SLACK_RESPONSE_URL = os.environ.get("SLACK_RESPONSE_URL", "")
 GITHUB_TOKEN       = os.environ.get("GITHUB_TOKEN", "")
 GITHUB_REPO        = os.environ.get("GITHUB_REPO", "")
-DRY_RUN            = os.environ.get("DRY_RUN", "true").lower() == "true"
-POLL_INTERVAL      = int(os.environ.get("POLL_INTERVAL", "3600"))
-MAX_WAIT_HOURS     = int(os.environ.get("MAX_WAIT_HOURS", "2"))
+DRY_RUN            = os.environ.get("DRY_RUN", "false").lower() == "true"
 
 LOGIN_URL          = "https://bhel.karexpert.com/account-management/login"
-AVAILABLE_COLOR    = "rgb(184, 233, 134)"
-OTP_POLL_SEC       = 5
+BOOKING_URL        = "https://bhel.karexpert.com/appointment/searchdoctor/searchdepartment/general/cleardate"
+
+POLL_INTERVAL_SEC  = 30      # poll every 30 seconds
+STOP_HOUR          = 7       # auto-stop hour
+STOP_MIN           = 20      # auto-stop minute (7:20 AM)
+OTP_POLL_SEC       = 3
 OTP_TIMEOUT_SEC    = 120
 
-# Strip country code — portal needs 10-digit number only (e.g. 9876543210)
-def get_mobile_10digit():
+# ── Helpers ───────────────────────────────────────────────────────────────────
+def get_mobile():
     m = MOBILE.strip()
-    if m.startswith("91") and len(m) == 12:
-        return m[2:]   # remove 91 prefix
-    if m.startswith("+91"):
-        return m[3:]   # remove +91 prefix
-    return m           # already 10 digits
+    if m.startswith("+91"): return m[3:]
+    if m.startswith("91") and len(m) == 12: return m[2:]
+    return m
+
+def log(msg):
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
 
 def slack(text, emoji=""):
     msg = f"{emoji} {text}".strip() if emoji else text
@@ -41,10 +50,11 @@ def slack(text, emoji=""):
                     break
             except Exception:
                 continue
-    print(f"[SLACK] {msg}", flush=True)
+    log(f"[SLACK] {msg[:80]}")
 
-def log(msg):
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
+def past_stop_time():
+    now = datetime.now()
+    return now.hour > STOP_HOUR or (now.hour == STOP_HOUR and now.minute >= STOP_MIN)
 
 def clear_otp():
     if not GITHUB_TOKEN or not GITHUB_REPO:
@@ -52,7 +62,8 @@ def clear_otp():
     try:
         requests.patch(
             f"https://api.github.com/repos/{GITHUB_REPO}/actions/variables/CURRENT_OTP",
-            headers={"Authorization": f"Bearer {GITHUB_TOKEN}", "Accept": "application/vnd.github+json"},
+            headers={"Authorization": f"Bearer {GITHUB_TOKEN}",
+                     "Accept": "application/vnd.github+json"},
             json={"name": "CURRENT_OTP", "value": ""},
             timeout=10,
         )
@@ -60,61 +71,99 @@ def clear_otp():
         pass
 
 def wait_for_otp():
+    """Wait for user to type /otp XXXXXX in Slack."""
     clear_otp()
     slack(
         "*OTP sent to your phone!* :iphone:\n\n"
-        "Please type this in Slack:\n"
-        "```/otp 123456```\n"
-        "_(replace with your actual OTP — you have 2 minutes)_", ":key:"
+        "Please type your 6-digit OTP in Slack:\n"
+        "```/otp 583921```\n"
+        "_(replace 583921 with your actual OTP)_\n"
+        "You have 2 minutes.", ":key:"
     )
-    log(f"Waiting up to {OTP_TIMEOUT_SEC}s for OTP ...")
+    log(f"Waiting up to {OTP_TIMEOUT_SEC}s for OTP from Slack ...")
     deadline = time.time() + OTP_TIMEOUT_SEC
     while time.time() < deadline:
         time.sleep(OTP_POLL_SEC)
         try:
             r = requests.get(
                 f"https://api.github.com/repos/{GITHUB_REPO}/actions/variables/CURRENT_OTP",
-                headers={"Authorization": f"Bearer {GITHUB_TOKEN}", "Accept": "application/vnd.github+json"},
+                headers={"Authorization": f"Bearer {GITHUB_TOKEN}",
+                         "Accept": "application/vnd.github+json"},
                 timeout=10,
             )
             if r.status_code == 200:
                 val = r.json().get("value", "").strip()
                 if val and val.isdigit() and len(val) >= 4:
-                    log("OTP received!")
+                    log(f"OTP received: {'*' * len(val)}")
                     clear_otp()
                     return val
         except Exception as e:
-            log(f"OTP poll error: {e}")
+            log(f"OTP poll: {e}")
     return None
 
 def find_available_slots(page):
+    """
+    Find all bookable slot buttons.
+
+    Slot appearance from portal screenshots:
+      - Available : white/light pill with dark text, no cursor:not-allowed
+      - Green pill : rgb(184,233,134) — also bookable
+      - Blocked   : cursor:not-allowed OR class contains disabled
+
+    Strategy: grab ALL visible _wf-pp-timebox buttons,
+    skip only the ones that are explicitly blocked.
+    """
     all_btns = page.locator("button._wf-pp-timebox")
     available = []
-    for i in range(all_btns.count()):
+    count = all_btns.count()
+
+    for i in range(count):
         btn = all_btns.nth(i)
         try:
-            style = btn.get_attribute("style") or ""
-            if AVAILABLE_COLOR in style and "not-allowed" not in style:
-                text = btn.inner_text().strip()
-                if text:
-                    available.append((btn, text))
+            # Must be visible
+            if not btn.is_visible():
+                continue
+
+            style   = btn.get_attribute("style") or ""
+            classes = btn.get_attribute("class") or ""
+
+            # Skip explicitly blocked slots
+            if "not-allowed" in style:
+                continue
+            if "cursor: not-allowed" in style:
+                continue
+            if "disabled" in classes.lower():
+                continue
+            if btn.is_disabled():
+                continue
+
+            text = btn.inner_text().strip()
+            if text:
+                available.append((btn, text))
         except Exception:
             continue
+
     return available
 
+# ── Main ──────────────────────────────────────────────────────────────────────
 def run():
     from playwright.sync_api import sync_playwright
 
-    mobile_10 = get_mobile_10digit()
-    log(f"Bot starting | Mobile: {mobile_10[:3]}XXXXXXX | DRY_RUN: {DRY_RUN}")
-    slack(f"*Bot initialising...* Opening portal for *Dr S {DOCTOR_SEARCH}*", ":robot_face:")
+    mobile = get_mobile()
+    log(f"Bot starting | Mobile: {mobile[:3]}XXXXXXX | DRY_RUN: {DRY_RUN}")
+    slack(
+        f"*Bot started!* :rocket:\n"
+        f"Opening portal for *Dr S {DOCTOR_SEARCH}*\n"
+        f"Will poll every *{POLL_INTERVAL_SEC}s* until *7:20 AM*",
+        ":robot_face:"
+    )
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         ctx  = browser.new_context(viewport={"width": 1280, "height": 800})
         page = ctx.new_page()
 
-        # ── Step 1: Open login page ───────────────────────────────────────────
+        # ── STEP 1: Open login page ───────────────────────────────────────────
         log("Opening login page ...")
         page.goto(LOGIN_URL, wait_until="networkidle", timeout=30000)
         try:
@@ -126,9 +175,9 @@ def run():
         except Exception:
             pass
         time.sleep(2)
-        log("Login page loaded")
+        log("Login page ready")
 
-        # ── Step 2: Click "Login With OTP" ────────────────────────────────────
+        # ── STEP 2: Click "Login With OTP" ───────────────────────────────────
         log("Clicking 'Login With OTP' ...")
         clicked = False
         for selector in ["span.cLink", ".cLink"]:
@@ -141,9 +190,8 @@ def run():
                     break
             except Exception:
                 continue
-
         if not clicked:
-            for tag in ["span", "a", "div", "button"]:
+            for tag in ["span", "a", "div"]:
                 try:
                     el = page.locator(tag).filter(has_text="Login With OTP").first
                     if el.is_visible(timeout=2000):
@@ -153,281 +201,302 @@ def run():
                         break
                 except Exception:
                     continue
-
         if not clicked:
-            slack(":x: Could not click 'Login With OTP'.")
+            slack(":x: Could not find 'Login With OTP'. Type `/start` to retry.")
             raise Exception("Login With OTP not found")
-
         time.sleep(2)
-        log("OTP form visible")
 
-        # ── Step 3: Enter 10-digit mobile number ──────────────────────────────
-        log(f"Entering mobile: {mobile_10[:3]}XXXXXXX ...")
+        # ── STEP 3: Enter mobile number ───────────────────────────────────────
+        log("Entering mobile ...")
         filled = False
-
-        # Portal uses formcontrolname="mob" based on DevTools screenshot
         for selector in [
             'input[formcontrolname="mob"]',
             'input[formcontrolname="mobile"]',
             'input[type="text"]',
             'input[type="tel"]',
-            'input[type="number"]',
         ]:
             try:
                 el = page.locator(selector).first
                 if el.is_visible(timeout=2000):
                     el.click()
-                    el.fill(mobile_10)   # 10-digit only, no country code
+                    el.fill(mobile)
                     filled = True
-                    log(f"Mobile filled via: {selector}")
+                    log(f"Mobile filled via {selector}")
                     break
             except Exception:
                 continue
-
         if not filled:
-            slack(":x: Could not find mobile input field.")
+            slack(":x: Could not find mobile input. Type `/start` to retry.")
             raise Exception("Mobile input not found")
-
         time.sleep(0.5)
 
-        # ── Step 4: Click Next button ─────────────────────────────────────────
+        # ── STEP 4: Click Next ────────────────────────────────────────────────
         log("Clicking Next ...")
         for selector in ["button.login-button", "button.btn-gradient"]:
             try:
                 el = page.locator(selector).first
                 if el.is_visible(timeout=2000):
                     el.click()
-                    log(f"Clicked Next via: {selector}")
+                    log(f"Clicked Next via {selector}")
                     break
             except Exception:
                 continue
-        else:
-            for label in ["Next", "Send OTP", "Send", "Continue", "Submit"]:
-                try:
-                    btn = page.get_by_role("button", name=label, exact=False).first
-                    if btn.is_visible(timeout=2000):
-                        btn.click()
-                        log(f"Clicked: '{label}'")
-                        break
-                except Exception:
-                    continue
-
         time.sleep(1.5)
 
-        # ── Step 5: Wait for OTP from Slack ──────────────────────────────────
+        # ── STEP 5: Wait for OTP from Slack ──────────────────────────────────
         otp_code = wait_for_otp()
         if not otp_code:
-            slack(":x: OTP timed out (2 min). Type `/book` to restart.", ":hourglass:")
+            slack(
+                ":hourglass: *OTP timed out* (2 min).\n"
+                "Type `/start` to restart.", ":x:"
+            )
             browser.close()
             return
 
-        # ── Step 6: Enter OTP into 6-box input ───────────────────────────────
-        # Portal uses app-otp-input with individual digit boxes
-        log(f"Entering OTP: {'*' * len(otp_code)} ...")
-        otp_entered = False
+        # ── STEP 6: Enter OTP digit by digit into 6-box input ────────────────
+        log(f"Entering OTP ({'*' * len(otp_code)}) ...")
+        otp_done = False
 
-        # Method 1: Type into individual input boxes inside app-otp-input
+        # Method 1: find individual input boxes inside app-otp-input
         try:
             otp_inputs = page.locator("app-otp-input input")
             count = otp_inputs.count()
             log(f"Found {count} OTP input boxes")
-            if count > 0:
+            if count >= len(otp_code):
                 for i, digit in enumerate(otp_code):
-                    if i < count:
-                        otp_inputs.nth(i).click()
-                        otp_inputs.nth(i).fill(digit)
-                        time.sleep(0.1)
-                otp_entered = True
+                    otp_inputs.nth(i).click()
+                    otp_inputs.nth(i).fill(digit)
+                    time.sleep(0.15)
+                otp_done = True
                 log("OTP entered digit by digit")
         except Exception as e:
-            log(f"OTP digit method failed: {e}")
+            log(f"OTP box method: {e}")
 
-        # Method 2: Find any visible input and type OTP
-        if not otp_entered:
-            for selector in [
-                'input[formcontrolname="otp"]',
-                'input[type="number"]',
-                'input[maxlength="6"]',
-                'input[maxlength="1"]',
-            ]:
-                try:
-                    el = page.locator(selector).first
-                    if el.is_visible(timeout=2000):
-                        el.fill(otp_code)
-                        otp_entered = True
-                        log(f"OTP filled via: {selector}")
-                        break
-                except Exception:
-                    continue
-
-        # Method 3: Use keyboard to type OTP after clicking first box
-        if not otp_entered:
+        # Method 2: click component and type
+        if not otp_done:
             try:
                 page.locator("app-otp-input").first.click()
                 page.keyboard.type(otp_code)
-                otp_entered = True
+                otp_done = True
                 log("OTP typed via keyboard")
             except Exception as e:
-                log(f"Keyboard OTP failed: {e}")
+                log(f"Keyboard OTP: {e}")
 
-        if not otp_entered:
-            slack(":x: Could not enter OTP. Please try again.")
-            raise Exception("OTP input failed")
-
+        if not otp_done:
+            slack(":x: Could not enter OTP. Type `/start` to retry.")
+            raise Exception("OTP entry failed")
         time.sleep(0.5)
 
-        # ── Step 7: Click Login / Next / Verify ──────────────────────────────
+        # ── STEP 7: Click Login ───────────────────────────────────────────────
         log("Clicking Login ...")
         for selector in ["button.login-button", "button.btn-gradient"]:
             try:
                 el = page.locator(selector).first
                 if el.is_visible(timeout=2000):
                     el.click()
-                    log(f"Clicked Login via: {selector}")
+                    log(f"Login via {selector}")
                     break
             except Exception:
                 continue
-        else:
-            for label in ["Login", "Next", "Verify", "Submit", "Sign In", "Proceed"]:
-                try:
-                    btn = page.get_by_role("button", name=label, exact=False).first
-                    if btn.is_visible(timeout=2000):
-                        btn.click()
-                        log(f"Clicked: '{label}'")
-                        break
-                except Exception:
-                    continue
-
         page.wait_for_load_state("networkidle", timeout=20000)
-        slack(":white_check_mark: Logged in! Navigating to Dr S Kamal Kumar...")
+        slack(":white_check_mark: *Logged in!* Navigating to booking page...")
         log("Logged in!")
 
-        # ── Step 8: Navigate directly to booking page (exact URL confirmed) ──
-        BOOKING_URL = "https://bhel.karexpert.com/appointment/searchdoctor/searchdepartment/general/cleardate"
+        # ── STEP 8: Go to booking page ────────────────────────────────────────
         log(f"Navigating to booking page ...")
-        page.goto(BOOKING_URL, wait_until="networkidle", timeout=20000)
-        time.sleep(2)
+        page.goto(BOOKING_URL, wait_until="networkidle", timeout=30000)
+        time.sleep(3)
         log("Booking page loaded")
 
-        # ── Step 9: Search doctor ─────────────────────────────────────────────
+        # ── STEP 9: Search for Dr Kamal Kumar ────────────────────────────────
         log(f"Searching: {DOCTOR_SEARCH} ...")
         try:
-            page.wait_for_selector('input[placeholder="Search Doctor"]', timeout=20000)
+            page.wait_for_selector('input[placeholder="Search Doctor"]', timeout=15000)
             search = page.locator('input[placeholder="Search Doctor"]')
             search.click()
             search.fill(DOCTOR_SEARCH)
             time.sleep(2)
-            log("Doctor search done")
+            page.wait_for_selector("div#doctor-card", timeout=10000)
+            log("Doctor cards loaded")
         except Exception as e:
-            log(f"Search error: {e}")
+            log(f"Search: {e}")
 
-        # ── Step 10: Click doctor's Book Appointment ──────────────────────────
-        log("Clicking doctor's Book Appointment ...")
+        # ── STEP 10: Click Book Appointment on Dr Kamal Kumar's card ──────────
+        log("Finding Dr S Kamal Kumar ...")
         try:
-            cards = page.locator("kx-search-doctor-list .ng-star-inserted")
-            found = False
-            for i in range(cards.count()):
+            cards = page.locator("div#doctor-card")
+            total = cards.count()
+            log(f"Found {total} doctor cards")
+            found_doctor = False
+            for i in range(total):
                 card = cards.nth(i)
-                if DOCTOR_SEARCH.split()[0] in (card.inner_text() or ""):
-                    card.get_by_text("Book Appointment", exact=False).click()
-                    found = True
-                    log("Clicked doctor card")
-                    break
-            if not found:
-                raise Exception("Card not found")
-        except Exception:
-            page.get_by_text("Book Appointment", exact=False).first.click()
+                try:
+                    card_text = card.inner_text() or ""
+                    if "Kamal" in card_text:
+                        log(f"Dr Kamal Kumar at card {i+1}")
+                        card.scroll_into_view_if_needed()
+                        time.sleep(0.5)
+                        btn = card.locator("button.primary-btn").first
+                        btn.wait_for(state="visible", timeout=5000)
+                        btn.click()
+                        found_doctor = True
+                        log("Clicked Book Appointment on Dr Kamal Kumar!")
+                        break
+                except Exception as e:
+                    log(f"Card {i+1}: {e}")
+            if not found_doctor:
+                log("Fallback: clicking first primary-btn ...")
+                page.locator("button.primary-btn").first.click()
+        except Exception as e:
+            slack(f":x: Could not find Dr Kamal Kumar: {e}")
+            raise
         time.sleep(2)
 
-        # ── Step 11 & 12: Check all dates, poll every hour ──────────────────
-        booking_url = page.url
-        log(f"Booking base URL: {booking_url}")
+        # Save doctor slot page URL for polling
+        doctor_page_url = page.url
+        log(f"Doctor page URL: {doctor_page_url}")
 
-        def check_all_dates_for_slots(pg):
-            """Click each date tab and look for green slots."""
-            try:
-                tabs = pg.locator("div.dottab")
-                total = tabs.count()
-                log(f"Checking {total} date tabs ...")
-                for i in range(total):
-                    try:
-                        tabs.nth(i).click()
-                        time.sleep(1.5)
-                        found = find_available_slots(pg)
-                        if found:
-                            date_label = tabs.nth(i).inner_text().strip()
-                            log(f"Slots on tab {i+1} ({date_label}): {[s[1] for s in found]}")
-                            return found, date_label
-                    except Exception as e:
-                        log(f"Tab {i+1} error: {e}")
-            except Exception as e:
-                log(f"Date tabs error: {e}")
-            return [], ""
-
-        max_iter = (MAX_WAIT_HOURS * 3600) // max(POLL_INTERVAL, 60)
         slack(
-            f":mag: Checking *all 7 dates* every *{POLL_INTERVAL//60} hour(s)* "
-            f"for up to *{MAX_WAIT_HOURS} hours*\n"
-            f"Pinging you the moment a slot opens!", ":calendar:"
+            f":mag: *Watching for slots every {POLL_INTERVAL_SEC} seconds*\n"
+            f"Checking last date tab only\n"
+            f"Bot auto-stops at *7:20 AM*\n"
+            f"I'll book the first available slot immediately!", ":clock630:"
         )
 
-        for attempt in range(1, max_iter + 1):
-            log(f"Attempt {attempt}/{max_iter} — reloading ...")
-            page.goto(booking_url, wait_until="networkidle", timeout=20000)
-            time.sleep(2)
+        # ── STEP 11: Poll every 30 seconds until 7:20 AM ─────────────────────
+        attempt = 0
+        while True:
+            attempt += 1
 
-            slots, date_text = check_all_dates_for_slots(page)
+            # Check stop time
+            if past_stop_time():
+                slack(
+                    ":stopwatch: *7:20 AM reached — bot stopping.*\n"
+                    "No slot was found today.\n"
+                    "Type `/start` tomorrow at 6:25 AM to try again.",
+                    ":x:"
+                )
+                log("7:20 AM — stopping")
+                break
 
-            if slots:
-                btn, slot_time = slots[0]
+            log(f"── Attempt {attempt} | {datetime.now().strftime('%H:%M:%S')} ──")
 
-                if DRY_RUN:
-                    slack(
-                        f":test_tube: *[DRY RUN]* Slot found!\n"
-                        f"Date: *{date_text}* | Time: *{slot_time}*\n"
-                        f"_DRY_RUN=true — NOT booked._", ":eyes:"
-                    )
-                    break
+            # Reload page
+            try:
+                page.goto(doctor_page_url, wait_until="networkidle", timeout=20000)
+                time.sleep(1.5)
+            except Exception as e:
+                log(f"Reload error: {e}")
+                time.sleep(POLL_INTERVAL_SEC)
+                continue
 
-                slack(f":zap: Slot: *{slot_time}* on *{date_text}* — booking now!", ":tada:")
-                btn.click()
-                page.wait_for_load_state("networkidle", timeout=15000)
-                time.sleep(1)
+            # Click LAST date tab
+            date_label = "last date"
+            try:
+                tabs = page.locator("div.dottab")
+                total_tabs = tabs.count()
+                if total_tabs > 0:
+                    last_tab = tabs.nth(total_tabs - 1)
+                    date_label = last_tab.inner_text().strip()
+                    last_tab.click()
+                    time.sleep(1.5)
+                    log(f"Clicked last tab ({total_tabs}/{total_tabs}): {date_label}")
+            except Exception as e:
+                log(f"Date tab: {e}")
 
-                confirmed = False
-                for label in ["Confirm", "Book", "Submit", "Proceed", "OK", "Yes"]:
+            # Find available slots
+            slots = find_available_slots(page)
+            log(f"Available slots on {date_label}: {[s[1] for s in slots] if slots else 'none'}")
+
+            if not slots:
+                log(f"No slots. Waiting {POLL_INTERVAL_SEC}s ...")
+                time.sleep(POLL_INTERVAL_SEC)
+                continue
+
+            # ── SLOT FOUND → BOOK IT ──────────────────────────────────────────
+            chosen_btn, chosen_time = slots[0]
+            log(f"SLOT FOUND: {chosen_time} on {date_label}")
+
+            if DRY_RUN:
+                slack(
+                    f":test_tube: *[DRY RUN]* Slot found!\n"
+                    f">  Date: *{date_label}*\n"
+                    f">  Time: *{chosen_time}*\n"
+                    f"_DRY_RUN=true — NOT booked._", ":eyes:"
+                )
+                log("DRY RUN — not booking")
+                break
+
+            slack(f":zap: *Slot found!* {chosen_time} on {date_label} — booking now!", ":tada:")
+
+            # Click the slot button
+            try:
+                chosen_btn.click()
+                time.sleep(2)
+            except Exception as e:
+                log(f"Slot click error: {e}")
+                time.sleep(POLL_INTERVAL_SEC)
+                continue
+
+            # Wait for booking cart to appear
+            log("Waiting for cart ...")
+            try:
+                page.wait_for_selector("kx-cart", timeout=10000)
+                log("Cart appeared")
+            except Exception:
+                log("Cart not detected — trying to confirm anyway")
+            time.sleep(1)
+
+            # Click "Book Appointment ✓" in cart
+            confirmed = False
+
+            # Primary: exact class from DevTools
+            for selector in [
+                "div._wf-pp-bookappointmentdivx2",
+                "._wf-pp-bookappointmentdivx2",
+            ]:
+                try:
+                    el = page.locator(selector).first
+                    if el.is_visible(timeout=5000):
+                        el.click()
+                        confirmed = True
+                        log(f"Confirmed via {selector}")
+                        break
+                except Exception:
+                    continue
+
+            # Fallback
+            if not confirmed:
+                for label in ["Book Appointment", "Confirm", "Book", "Submit", "OK"]:
                     try:
                         cb = page.get_by_role("button", name=label, exact=False).first
                         if cb.is_visible(timeout=3000):
                             cb.click()
-                            page.wait_for_load_state("networkidle", timeout=15000)
                             confirmed = True
+                            log(f"Confirmed via '{label}'")
                             break
                     except Exception:
                         continue
 
-                now = datetime.now().strftime("%d-%b-%Y %H:%M:%S")
-                slack(
-                    f"*Appointment Successfully Booked!* :white_check_mark:\n\n"
-                    f">  *Doctor:* Dr S Kamal Kumar\n"
-                    f">  *Date:* {date_text}\n"
-                    f">  *Slot:* {slot_time}\n"
-                    f">  *Booked at:* {now}\n"
-                    f">  *Portal:* bhel.karexpert.com",
-                    ":hospital:"
-                )
-                log("Booked!")
-                break
+            page.wait_for_load_state("networkidle", timeout=15000)
+            now_str = datetime.now().strftime("%d-%b-%Y %H:%M:%S")
 
-            next_check = datetime.fromtimestamp(time.time() + POLL_INTERVAL).strftime("%H:%M:%S")
             slack(
-                f":calendar: *Check {attempt}/{max_iter}:* No open slots on any date.\n"
-                f"Next check at *{next_check}*", ":hourglass_flowing_sand:"
+                f"*Appointment Successfully Booked!* :white_check_mark:\n\n"
+                f">  *Doctor:*  Dr S Kamal Kumar\n"
+                f">  *Date:*    {date_label}\n"
+                f">  *Slot:*    {chosen_time}\n"
+                f">  *Booked:*  {now_str}\n"
+                f">  *Portal:*  bhel.karexpert.com\n\n"
+                f"{'_Confirmed on portal._' if confirmed else '_Please verify on portal manually._'}",
+                ":hospital:"
             )
-            time.sleep(POLL_INTERVAL)
+            log("DONE — Appointment booked!")
+            break
 
-        else:
-            slack(f"*No slot found after {MAX_WAIT_HOURS} hours.* Type `/book` to retry.", ":x:")
+        browser.close()
+        log("Browser closed. Done.")
+
 
 if __name__ == "__main__":
     try:
@@ -437,5 +506,5 @@ if __name__ == "__main__":
         log(f"CRASH:\n{err}")
         slack(
             f"*Bot crashed!* :rotating_light:\n```{err[-800:]}```\n"
-            f"_Type `/book` to restart._", ":x:"
+            f"_Type `/start` to restart._", ":x:"
         )
