@@ -316,29 +316,36 @@ def run():
                     break
             except Exception:
                 continue
-        page.wait_for_load_state("networkidle", timeout=20000)
-        time.sleep(3)  # Extra wait for Angular session to establish
-
-        # Verify we are actually logged in (not redirected back to login)
-        current_url = page.url
-        log(f"Post-login URL: {current_url}")
-        if "login" in current_url.lower():
-            log("Still on login page — waiting more ...")
-            time.sleep(3)
-            page.wait_for_load_state("networkidle", timeout=10000)
+        # Wait for dashboard redirect after OTP login
+        # URL flow: loginwithotp → dynamic_dashboard/BHEL CARE
+        # Portal can take 10-20 seconds to validate OTP and redirect
+        log("Waiting for dashboard after login (up to 30s) ...")
+        try:
+            # Wait up to 30 seconds for URL to become dynamic_dashboard
+            page.wait_for_url("**/dynamic_dashboard/**", timeout=30000)
+            log(f"Dashboard URL confirmed: {page.url}")
+        except Exception:
+            # Fallback: wait 20 more seconds and check manually
+            log("wait_for_url timed out — waiting 20s more ...")
+            time.sleep(20)
             current_url = page.url
             log(f"URL after extra wait: {current_url}")
-            if "login" in current_url.lower():
-                slack(":x: Login failed — still on login page. Check mobile/OTP and try `/start` again.")
-                raise Exception("Login redirect — session not established")
+            if "dynamic_dashboard" not in current_url:
+                slack(
+                    ":x: Login did not reach dashboard after 50 seconds.\n"
+                    "Please check your mobile number in GitHub Secrets.\n"
+                    "Type `/start` to retry."
+                )
+                raise Exception("Dashboard not reached after login")
 
         slack(":white_check_mark: *Logged in!* Navigating to booking page...")
-        log("Logged in!")
+        log("Logged in — dashboard confirmed!")
 
-        # ── STEP 8: Go to booking page ────────────────────────────────────────
+        # ── STEP 8: Navigate directly to booking page ─────────────────────────
         log("Navigating to booking page ...")
         page.goto(BOOKING_URL, wait_until="networkidle", timeout=30000)
-        time.sleep(5)  # Angular needs time to render doctor list
+        time.sleep(5)
+
 
         # Confirm we are on the booking page (not redirected to login)
         booking_current_url = page.url
