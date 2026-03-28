@@ -27,7 +27,7 @@ POLL_INTERVAL_SEC  = 30      # poll every 30 seconds
 STOP_HOUR          = 7       # auto-stop hour IST
 STOP_MIN           = 10      # auto-stop minute (7:10 AM IST)
 OTP_POLL_SEC       = 3
-OTP_TIMEOUT_SEC    = 60    # 60s: ~20s SMS arrives + ~30s to type /otp
+OTP_TIMEOUT_SEC    = 40    # 40s max: bot acts immediately when OTP received
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 def get_mobile():
@@ -94,7 +94,7 @@ def wait_for_otp():
         ":point_right: As soon as you receive the SMS, type:\n"
         "```/otp 583921```\n"
         "_(replace 583921 with your 6-digit OTP)_\n"
-        ":alarm_clock: You have *60 seconds*. Be quick!", ":key:"
+        ":alarm_clock: You have *40 seconds* max. Bot acts immediately!", ":key:"
     )
     log(f"Waiting up to {OTP_TIMEOUT_SEC}s for OTP from Slack ...")
     deadline = time.time() + OTP_TIMEOUT_SEC
