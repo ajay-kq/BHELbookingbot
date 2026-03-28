@@ -302,12 +302,40 @@ def run():
         slack(":white_check_mark: Logged in! Navigating to Dr S Kamal Kumar...")
         log("Logged in!")
 
-        # ── Step 8: Book Appointment ──────────────────────────────────────────
+        # ── Step 8: Navigate to Book Appointment ────────────────────────────
+        # Dashboard uses tile-link <a> elements not buttons
         log("Going to Book Appointment ...")
+        nav_done = False
+
+        # Method 1: tile-link (from DevTools screenshot)
         try:
-            page.get_by_role("button", name="Book Appointment").first.click()
+            el = page.locator('a.tile-link').first
+            if el.is_visible(timeout=5000):
+                el.click()
+                nav_done = True
+                log("Navigated via tile-link")
         except Exception:
-            page.get_by_text("Book Appointment", exact=False).first.click()
+            pass
+
+        # Method 2: any element with Book Appointment text
+        if not nav_done:
+            for selector in ["a", "button", "div", "span"]:
+                try:
+                    el = page.locator(selector).filter(has_text="Book Appointment").first
+                    if el.is_visible(timeout=3000):
+                        el.click()
+                        nav_done = True
+                        log(f"Navigated via <{selector}>")
+                        break
+                except Exception:
+                    continue
+
+        # Method 3: direct URL
+        if not nav_done:
+            log("Using direct URL navigation ...")
+            page.goto("https://bhel.karexpert.com/patient-portal/book-appointment",
+                      wait_until="networkidle", timeout=20000)
+
         page.wait_for_load_state("networkidle", timeout=20000)
 
         # ── Step 9: Search doctor ─────────────────────────────────────────────
