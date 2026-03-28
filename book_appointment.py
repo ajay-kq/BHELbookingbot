@@ -339,47 +339,57 @@ def run():
             page.get_by_text("Book Appointment", exact=False).first.click()
         time.sleep(2)
 
-        # ── Step 11: Select furthest date (7th day) ───────────────────────────
-        log("Selecting furthest date ...")
-        try:
-            date_tabs = page.locator("div.dottab")
-            total = date_tabs.count()
-            if total > 0:
-                date_tabs.nth(total - 1).click()
-                log(f"Selected date {total}/{total}")
-                time.sleep(1.5)
-        except Exception as e:
-            log(f"Date: {e}")
-
+        # ── Step 11 & 12: Check all dates, poll every hour ──────────────────
         booking_url = page.url
-        log(f"Booking URL: {booking_url}")
+        log(f"Booking base URL: {booking_url}")
 
-        # ── Step 12: Poll for green slots ─────────────────────────────────────
+        def check_all_dates_for_slots(pg):
+            """Click each date tab and look for green slots."""
+            try:
+                tabs = pg.locator("div.dottab")
+                total = tabs.count()
+                log(f"Checking {total} date tabs ...")
+                for i in range(total):
+                    try:
+                        tabs.nth(i).click()
+                        time.sleep(1.5)
+                        found = find_available_slots(pg)
+                        if found:
+                            date_label = tabs.nth(i).inner_text().strip()
+                            log(f"Slots on tab {i+1} ({date_label}): {[s[1] for s in found]}")
+                            return found, date_label
+                    except Exception as e:
+                        log(f"Tab {i+1} error: {e}")
+            except Exception as e:
+                log(f"Date tabs error: {e}")
+            return [], ""
+
         max_iter = (MAX_WAIT_HOURS * 3600) // max(POLL_INTERVAL, 60)
         slack(
-            f":mag: Checking every *{POLL_INTERVAL//60} hour(s)* for up to *{MAX_WAIT_HOURS} hours*\n"
-            f"I'll ping you the moment a slot opens!", ":calendar:"
+            f":mag: Checking *all 7 dates* every *{POLL_INTERVAL//60} hour(s)* "
+            f"for up to *{MAX_WAIT_HOURS} hours*\n"
+            f"Pinging you the moment a slot opens!", ":calendar:"
         )
 
         for attempt in range(1, max_iter + 1):
-            log(f"Attempt {attempt}/{max_iter} ...")
+            log(f"Attempt {attempt}/{max_iter} — reloading ...")
             page.goto(booking_url, wait_until="networkidle", timeout=20000)
             time.sleep(2)
 
-            slots = find_available_slots(page)
-            log(f"Green slots: {[s[1] for s in slots] if slots else 'none'}")
+            slots, date_text = check_all_dates_for_slots(page)
 
             if slots:
                 btn, slot_time = slots[0]
 
                 if DRY_RUN:
                     slack(
-                        f":test_tube: *[DRY RUN]* Slot: *{slot_time}* — NOT booked (DRY_RUN=true)",
-                        ":eyes:"
+                        f":test_tube: *[DRY RUN]* Slot found!\n"
+                        f"Date: *{date_text}* | Time: *{slot_time}*\n"
+                        f"_DRY_RUN=true — NOT booked._", ":eyes:"
                     )
                     break
 
-                slack(f":zap: Slot: *{slot_time}* — booking now!", ":tada:")
+                slack(f":zap: Slot: *{slot_time}* on *{date_text}* — booking now!", ":tada:")
                 btn.click()
                 page.wait_for_load_state("networkidle", timeout=15000)
                 time.sleep(1)
@@ -400,6 +410,7 @@ def run():
                 slack(
                     f"*Appointment Successfully Booked!* :white_check_mark:\n\n"
                     f">  *Doctor:* Dr S Kamal Kumar\n"
+                    f">  *Date:* {date_text}\n"
                     f">  *Slot:* {slot_time}\n"
                     f">  *Booked at:* {now}\n"
                     f">  *Portal:* bhel.karexpert.com",
@@ -410,17 +421,13 @@ def run():
 
             next_check = datetime.fromtimestamp(time.time() + POLL_INTERVAL).strftime("%H:%M:%S")
             slack(
-                f":calendar: *Check {attempt}/{max_iter}:* No open slots.\n"
+                f":calendar: *Check {attempt}/{max_iter}:* No open slots on any date.\n"
                 f"Next check at *{next_check}*", ":hourglass_flowing_sand:"
             )
             time.sleep(POLL_INTERVAL)
 
         else:
             slack(f"*No slot found after {MAX_WAIT_HOURS} hours.* Type `/book` to retry.", ":x:")
-
-        browser.close()
-        log("Done.")
-
 
 if __name__ == "__main__":
     try:
