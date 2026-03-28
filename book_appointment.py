@@ -13,7 +13,7 @@ from datetime import datetime
 
 # ── Config ────────────────────────────────────────────────────────────────────
 MOBILE             = os.environ["MOBILE"]
-DOCTOR_SEARCH      = os.environ.get("DOCTOR_SEARCH", "Kamal Kumar")
+DOCTOR_SEARCH      = os.environ.get("DOCTOR_SEARCH", "Dr S Kamal Kumar")
 SLACK_WEBHOOK      = os.environ.get("SLACK_WEBHOOK", "")
 SLACK_RESPONSE_URL = os.environ.get("SLACK_RESPONSE_URL", "")
 GITHUB_TOKEN       = os.environ.get("GITHUB_TOKEN", "")
@@ -27,7 +27,7 @@ POLL_INTERVAL_SEC  = 30      # poll every 30 seconds
 STOP_HOUR          = 7       # auto-stop hour IST
 STOP_MIN           = 10      # auto-stop minute (7:10 AM IST)
 OTP_POLL_SEC       = 3
-OTP_TIMEOUT_SEC    = 120
+OTP_TIMEOUT_SEC    = 60    # 60s: ~20s SMS arrives + ~30s to type /otp
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 def get_mobile():
@@ -91,10 +91,10 @@ def wait_for_otp():
     clear_otp()
     slack(
         "*OTP sent to your phone!* :iphone:\n\n"
-        "Please type your 6-digit OTP in Slack:\n"
+        ":point_right: As soon as you receive the SMS, type:\n"
         "```/otp 583921```\n"
-        "_(replace 583921 with your actual OTP)_\n"
-        "You have 2 minutes.", ":key:"
+        "_(replace 583921 with your 6-digit OTP)_\n"
+        ":alarm_clock: You have *60 seconds*. Be quick!", ":key:"
     )
     log(f"Waiting up to {OTP_TIMEOUT_SEC}s for OTP from Slack ...")
     deadline = time.time() + OTP_TIMEOUT_SEC
@@ -321,22 +321,21 @@ def run():
         # Portal can take 10-20 seconds to validate OTP and redirect
         log("Waiting for dashboard after login (up to 30s) ...")
         try:
-            # Wait up to 30 seconds for URL to become dynamic_dashboard
-            page.wait_for_url("**/dynamic_dashboard/**", timeout=30000)
-            log(f"Dashboard URL confirmed: {page.url}")
+            # Wait up to 15 seconds for URL to become dynamic_dashboard
+            page.wait_for_url("**/dynamic_dashboard/**", timeout=15000)
+            log(f"Dashboard URL: {page.url}")
         except Exception:
-            # Fallback: wait 20 more seconds and check manually
-            log("wait_for_url timed out — waiting 20s more ...")
-            time.sleep(20)
+            # Fallback: wait 10 more seconds
+            log("Waiting 10s more for dashboard ...")
+            time.sleep(10)
             current_url = page.url
-            log(f"URL after extra wait: {current_url}")
+            log(f"URL: {current_url}")
             if "dynamic_dashboard" not in current_url:
                 slack(
-                    ":x: Login did not reach dashboard after 50 seconds.\n"
-                    "Please check your mobile number in GitHub Secrets.\n"
-                    "Type `/start` to retry."
+                    ":x: Login failed — dashboard not reached.\n"
+                    "Type `/start` to retry quickly!"
                 )
-                raise Exception("Dashboard not reached after login")
+                raise Exception("Dashboard not reached")
 
         slack(":white_check_mark: *Logged in!* Navigating to booking page...")
         log("Logged in — dashboard confirmed!")
@@ -344,7 +343,7 @@ def run():
         # ── STEP 8: Navigate directly to booking page ─────────────────────────
         log("Navigating to booking page ...")
         page.goto(BOOKING_URL, wait_until="networkidle", timeout=30000)
-        time.sleep(5)
+        time.sleep(3)
 
 
         # Confirm we are on the booking page (not redirected to login)
@@ -374,7 +373,7 @@ def run():
         log("Booking page loaded")
 
         # ── STEP 9: Search for Dr Kamal Kumar ─────────────────────────────────
-        log(f"Searching: {DOCTOR_SEARCH} ...")
+        log("Searching: Dr S Kamal Kumar ...")
         search_done = False
 
         # Try search box
@@ -383,7 +382,7 @@ def run():
                 search = page.locator('input[placeholder="Search Doctor"]')
                 if search.is_visible(timeout=5000):
                     search.click()
-                    search.fill(DOCTOR_SEARCH)
+                    search.fill("Dr S Kamal Kumar")
                     time.sleep(2)
                     search_done = True
                     log("Search filled")
@@ -404,74 +403,72 @@ def run():
             log("Doctor cards timeout — trying anyway")
 
         # ── STEP 10: Click Book Appointment on Dr Kamal Kumar's card ──────────
+        # Button class from DevTools: button.primary-btn.disabledBookBtn
         log("Finding Dr S Kamal Kumar ...")
         found_doctor = False
 
-        # Try multiple card selectors
-        for card_selector in ["div#doctor-card", "div._wf-pp-divforcard", "kx-search-doctor-list .ng-star-inserted"]:
-            try:
-                cards = page.locator(card_selector)
-                total = cards.count()
-                log(f"Selector '{card_selector}': {total} cards")
+        try:
+            # Wait for doctor cards
+            page.wait_for_selector("div#doctor-card", timeout=15000)
+            time.sleep(1)
 
-                if total == 0:
-                    continue
+            cards = page.locator("div#doctor-card")
+            total = cards.count()
+            log(f"Found {total} doctor cards")
 
-                for i in range(total):
-                    card = cards.nth(i)
-                    try:
-                        card_text = card.inner_text() or ""
-                        if "Kamal" in card_text or DOCTOR_SEARCH.split()[0] in card_text:
-                            log(f"Found Dr Kamal Kumar at card {i+1}")
-                            card.scroll_into_view_if_needed()
-                            time.sleep(0.5)
-                            # Try primary-btn first
-                            for btn_sel in ["button.primary-btn", "button.primary-btn.disabledBookBtn", "button[class*='primary']"]:
-                                try:
-                                    btn = card.locator(btn_sel).first
-                                    if btn.is_visible(timeout=3000):
-                                        btn.click()
-                                        found_doctor = True
-                                        log(f"Clicked via {btn_sel}")
-                                        break
-                                except Exception:
-                                    continue
-                            if found_doctor:
-                                break
-                    except Exception as e:
-                        log(f"Card {i+1}: {e}")
+            for i in range(total):
+                card = cards.nth(i)
+                try:
+                    card_text = card.inner_text() or ""
+                    if "Kamal Kumar" in card_text or "Dr S Kamal" in card_text:
+                        log(f"Dr Kamal Kumar found at card {i+1}")
+                        card.scroll_into_view_if_needed()
+                        time.sleep(0.5)
 
-                if found_doctor:
-                    break
-            except Exception as e:
-                log(f"Card selector '{card_selector}': {e}")
+                        # Exact button class from DevTools screenshot
+                        for btn_sel in [
+                            "button.primary-btn.disabledBookBtn",  # exact class
+                            "button.primary-btn",                   # fallback
+                            "button[class*='primary-btn']",         # partial match
+                        ]:
+                            try:
+                                btn = card.locator(btn_sel).first
+                                if btn.is_visible(timeout=3000):
+                                    btn.click()
+                                    found_doctor = True
+                                    log(f"Clicked via: {btn_sel}")
+                                    break
+                            except Exception:
+                                continue
 
+                        if found_doctor:
+                            break
+                except Exception as e:
+                    log(f"Card {i+1}: {e}")
+
+        except Exception as e:
+            log(f"Doctor cards error: {e}")
+
+        # Fallback: find button containing "Book Appointment" text near "Kamal"
         if not found_doctor:
-            # Last resort: take a screenshot hint and click first visible primary-btn
-            log("Last resort: clicking first visible primary-btn on page ...")
+            log("Fallback: searching all Book Appointment buttons ...")
             try:
-                btns = page.locator("button.primary-btn")
+                # Get all primary-btn buttons
+                btns = page.locator("button.primary-btn, button.primary-btn.disabledBookBtn")
                 count = btns.count()
-                log(f"Found {count} primary-btn buttons total")
+                log(f"Total Book buttons: {count}")
                 for i in range(count):
                     try:
                         btn = btns.nth(i)
                         if btn.is_visible(timeout=2000):
-                            btn_text = btn.inner_text().strip()
-                            log(f"Button {i+1}: '{btn_text}'")
-                            if "Book" in btn_text or "Appointment" in btn_text:
-                                btn.click()
-                                found_doctor = True
-                                log(f"Clicked button: '{btn_text}'")
-                                break
+                            btn.click()
+                            found_doctor = True
+                            log(f"Clicked button {i+1}")
+                            break
                     except Exception:
                         continue
-                if not found_doctor and count > 0:
-                    btns.first.click()
-                    found_doctor = True
-                    log("Clicked first primary-btn")
             except Exception as e:
-                slack(f":x: Cannot find Book Appointment button: {e}")
+                slack(f":x: Cannot find Book Appointment for Dr Kamal Kumar: {e}")
                 raise Exception(f"Book button not found: {e}")
 
         time.sleep(2)
@@ -480,15 +477,22 @@ def run():
         doctor_page_url = page.url
         log(f"Doctor page URL: {doctor_page_url}")
 
+        # Calculate what the 7th date will be
+        from datetime import timedelta
+        ist_now = get_ist_time()
+        seventh_date = (ist_now + timedelta(days=6)).strftime("%d %b")
+
         slack(
-            f":mag: *Watching for slots every {POLL_INTERVAL_SEC} seconds*\n"
-            f"Checking last date tab only\n"
-            f"Bot auto-stops at *7:10 AM IST*\n"
-            f"I'll book the first available slot immediately!", ":clock630:"
+            f":mag: *Bot is watching every {POLL_INTERVAL_SEC} seconds*\n"
+            f">  Checking: *last date tab* (7th day = ~{seventh_date})\n"
+            f">  Slot opens: *~6:30 AM IST daily*\n"
+            f">  Bot stops: *7:10 AM IST*\n"
+            f"Will book the first available slot instantly!", ":clock630:"
         )
 
         # ── STEP 11: Poll every 30 seconds until 7:10 AM IST ────────────────────
         attempt = 0
+        prev_tab_count = 0   # track tab count to detect new date being added
         while True:
             attempt += 1
 
@@ -514,19 +518,41 @@ def run():
                 time.sleep(POLL_INTERVAL_SEC)
                 continue
 
-            # Click LAST date tab
+            # Click LAST date tab — portal adds a NEW tab anytime 6:30–7:15 AM IST
+            # Track tab count — if it increases, new date was just unlocked!
             date_label = "last date"
             try:
+                page.wait_for_selector("div.dottab", timeout=10000)
+                time.sleep(0.5)
                 tabs = page.locator("div.dottab")
                 total_tabs = tabs.count()
+
                 if total_tabs > 0:
+                    # Detect if new tab was added since last check
+                    if total_tabs > prev_tab_count:
+                        log(f"NEW DATE TAB DETECTED! Was {prev_tab_count}, now {total_tabs}")
+                        slack(
+                            f":tada: *New date unlocked!* Portal now shows {total_tabs} dates.\n"
+                            f"Checking the new slot immediately!", ""
+                        )
+
+                    prev_tab_count = total_tabs
                     last_tab = tabs.nth(total_tabs - 1)
                     date_label = last_tab.inner_text().strip()
                     last_tab.click()
                     time.sleep(1.5)
-                    log(f"Clicked last tab ({total_tabs}/{total_tabs}): {date_label}")
+                    log(f"Last tab ({total_tabs}/{total_tabs}): {date_label}")
+
+                    # On first attempt, notify which date we are watching
+                    if attempt == 1:
+                        slack(
+                            f":calendar: Watching *{date_label}* (tab {total_tabs} — newest date)\n"
+                            f"Polling every 30s. New tab may appear 6:30–7:15 AM IST.", ""
+                        )
+                else:
+                    log("No date tabs found!")
             except Exception as e:
-                log(f"Date tab: {e}")
+                log(f"Date tab error: {e}")
 
             # Find available slots
             slots = find_available_slots(page)
