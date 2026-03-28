@@ -302,51 +302,24 @@ def run():
         slack(":white_check_mark: Logged in! Navigating to Dr S Kamal Kumar...")
         log("Logged in!")
 
-        # ── Step 8: Navigate to Book Appointment ────────────────────────────
-        # Dashboard uses tile-link <a> elements not buttons
-        log("Going to Book Appointment ...")
-        nav_done = False
-
-        # Method 1: tile-link (from DevTools screenshot)
-        try:
-            el = page.locator('a.tile-link').first
-            if el.is_visible(timeout=5000):
-                el.click()
-                nav_done = True
-                log("Navigated via tile-link")
-        except Exception:
-            pass
-
-        # Method 2: any element with Book Appointment text
-        if not nav_done:
-            for selector in ["a", "button", "div", "span"]:
-                try:
-                    el = page.locator(selector).filter(has_text="Book Appointment").first
-                    if el.is_visible(timeout=3000):
-                        el.click()
-                        nav_done = True
-                        log(f"Navigated via <{selector}>")
-                        break
-                except Exception:
-                    continue
-
-        # Method 3: direct URL
-        if not nav_done:
-            log("Using direct URL navigation ...")
-            page.goto("https://bhel.karexpert.com/patient-portal/book-appointment",
-                      wait_until="networkidle", timeout=20000)
-
-        page.wait_for_load_state("networkidle", timeout=20000)
+        # ── Step 8: Navigate directly to booking page (exact URL confirmed) ──
+        BOOKING_URL = "https://bhel.karexpert.com/appointment/searchdoctor/searchdepartment/general/cleardate"
+        log(f"Navigating to booking page ...")
+        page.goto(BOOKING_URL, wait_until="networkidle", timeout=20000)
+        time.sleep(2)
+        log("Booking page loaded")
 
         # ── Step 9: Search doctor ─────────────────────────────────────────────
         log(f"Searching: {DOCTOR_SEARCH} ...")
         try:
+            page.wait_for_selector('input[placeholder="Search Doctor"]', timeout=20000)
             search = page.locator('input[placeholder="Search Doctor"]')
             search.click()
             search.fill(DOCTOR_SEARCH)
             time.sleep(2)
+            log("Doctor search done")
         except Exception as e:
-            log(f"Search: {e}")
+            log(f"Search error: {e}")
 
         # ── Step 10: Click doctor's Book Appointment ──────────────────────────
         log("Clicking doctor's Book Appointment ...")
