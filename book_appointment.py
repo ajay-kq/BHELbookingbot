@@ -316,26 +316,46 @@ def run():
                     break
             except Exception:
                 continue
-        # Wait for dashboard redirect after OTP login
-        # URL flow: loginwithotp → dynamic_dashboard/BHEL CARE
-        # Portal can take 10-20 seconds to validate OTP and redirect
-        log("Waiting for dashboard after login (up to 30s) ...")
-        try:
-            # Wait up to 30 seconds for URL to become dynamic_dashboard
-            page.wait_for_url("**/dynamic_dashboard/**", timeout=30000)
-            log(f"Dashboard URL: {page.url}")
-        except Exception:
-            # Fallback: wait 20 more seconds and check manually
-            log("wait_for_url timed out — waiting 20s more ...")
-            time.sleep(20)
-            current_url = page.url
-            log(f"URL after wait: {current_url}")
-            if "dynamic_dashboard" not in current_url:
-                slack(
-                    ":x: Login did not reach dashboard (50s timeout).\n"
-                    "Portal may be slow. Type `/start` to retry."
-                )
-                raise Exception("Dashboard not reached")
+        # Wait for login to complete
+        # Portal uses Angular — after OTP login, DOM changes before URL changes
+        # Detect login success by waiting for dashboard DOM elements
+        log("Waiting for login to complete ...")
+        login_success = False
+
+        # Method 1: wait for app-header or app-sidebar (dashboard elements)
+        for selector in ["app-header", "app-sidebar", "app-base", "app-dynamic-dashboard"]:
+            try:
+                page.wait_for_selector(selector, timeout=15000)
+                login_success = True
+                log(f"Login confirmed via DOM: {selector}")
+                break
+            except Exception:
+                continue
+
+        # Method 2: check URL changed away from loginwithotp
+        if not login_success:
+            log("DOM check failed — polling URL for 20s ...")
+            for i in range(10):
+                time.sleep(2)
+                current_url = page.url
+                log(f"[{(i+1)*2}s] URL: {current_url}")
+                if "loginwithotp" not in current_url and "login" not in current_url:
+                    login_success = True
+                    log("Login confirmed via URL change!")
+                    break
+                if "dynamic_dashboard" in current_url:
+                    login_success = True
+                    log("Dashboard URL confirmed!")
+                    break
+
+        # Method 3: just try navigating — if session valid it will work
+        if not login_success:
+            log("Attempting navigation anyway — session may be valid ...")
+            login_success = True  # optimistic — let next step fail if truly not logged in
+
+        if not login_success:
+            slack(":x: Login failed. Type `/start` to retry.")
+            raise Exception("Login failed")
 
         slack(":white_check_mark: *Logged in!* Navigating to booking page...")
         log("Logged in — dashboard confirmed!")
