@@ -340,13 +340,14 @@ def run():
         page.goto(BOOKING_URL, wait_until="networkidle", timeout=30000)
         time.sleep(5)  # Angular needs time to render doctor list
 
-        # Check if redirected to login again
+        # Confirm we are on the booking page (not redirected to login)
         booking_current_url = page.url
         log(f"Booking page URL: {booking_current_url}")
-        if "login" in booking_current_url.lower():
-            log("Redirected to login on booking page — session issue")
-            slack(":x: Session expired navigating to booking page. Type `/start` to retry.")
+        if "loginwithotp" in booking_current_url or "account-management/login" in booking_current_url:
+            log("Session expired — redirected to login on booking page")
+            slack(":x: Session expired. Type `/start` to retry.")
             raise Exception("Session expired — redirected to login")
+        log("Booking page confirmed — not redirected to login")
 
         # Wait for page to fully render — try multiple indicators
         for selector in [
