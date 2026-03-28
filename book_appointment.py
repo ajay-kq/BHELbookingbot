@@ -170,7 +170,7 @@ def run():
     ist = get_ist_time()
     slack(
         f"*Bot started!* :rocket:\n"
-        f"Opening portal for *Dr S {DOCTOR_SEARCH}*\n"
+        f"Opening portal for *{DOCTOR_SEARCH}*\n"
         f"IST time now: *{ist.strftime('%H:%M:%S')}*\n"
         f"Will poll every *{POLL_INTERVAL_SEC}s* until *7:10 AM IST*",
         ":robot_face:"
@@ -321,19 +321,19 @@ def run():
         # Portal can take 10-20 seconds to validate OTP and redirect
         log("Waiting for dashboard after login (up to 30s) ...")
         try:
-            # Wait up to 15 seconds for URL to become dynamic_dashboard
-            page.wait_for_url("**/dynamic_dashboard/**", timeout=15000)
+            # Wait up to 30 seconds for URL to become dynamic_dashboard
+            page.wait_for_url("**/dynamic_dashboard/**", timeout=30000)
             log(f"Dashboard URL: {page.url}")
         except Exception:
-            # Fallback: wait 10 more seconds
-            log("Waiting 10s more for dashboard ...")
-            time.sleep(10)
+            # Fallback: wait 20 more seconds and check manually
+            log("wait_for_url timed out — waiting 20s more ...")
+            time.sleep(20)
             current_url = page.url
-            log(f"URL: {current_url}")
+            log(f"URL after wait: {current_url}")
             if "dynamic_dashboard" not in current_url:
                 slack(
-                    ":x: Login failed — dashboard not reached.\n"
-                    "Type `/start` to retry quickly!"
+                    ":x: Login did not reach dashboard (50s timeout).\n"
+                    "Portal may be slow. Type `/start` to retry."
                 )
                 raise Exception("Dashboard not reached")
 
