@@ -1,0 +1,11 @@
+{
+  "version": 2,
+  "functions": {
+    "api/book.js": { "maxDuration": 10 },
+    "api/otp.js":  { "maxDuration": 10 }
+  },
+  "routes": [
+    { "src": "/book", "dest": "/api/book.js" },
+    { "src": "/otp",  "dest": "/api/otp.js"  }
+  ]
+}
