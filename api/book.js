@@ -1,17 +1,20 @@
-// api/book.js  — Vercel serverless function
-// Receives /book slash command from Slack
-// Triggers GitHub Actions workflow
-// Sends immediate acknowledgement back to Slack
+import querystring from "querystring";
 
 export default async function handler(req, res) {
   if (req.method !== "POST") return res.status(405).send("Method not allowed");
 
-  const { text, user_name, response_url } = req.body;
+  // Slack sends form-encoded data, not JSON
+  let body = req.body;
+  if (typeof body === "string") {
+    body = querystring.parse(body);
+  }
+
+  const { user_name, response_url } = body;
 
   // Immediately acknowledge Slack (must respond within 3 seconds)
   res.status(200).json({
     response_type: "in_channel",
-    text: `*BHEL Appointment Bot started!* :rocket:\n Triggered by @${user_name}\n I'll send an OTP prompt here shortly. Stand by...`,
+    text: `*BHEL Appointment Bot started!* :rocket:\nTriggered by @${user_name || "user"}\nI'll send an OTP prompt here shortly. Stand by...`,
   });
 
   // Trigger GitHub Actions workflow_dispatch
@@ -28,8 +31,8 @@ export default async function handler(req, res) {
         body: JSON.stringify({
           ref: "main",
           inputs: {
-            response_url: response_url,
-            triggered_by: user_name,
+            response_url: response_url || "",
+            triggered_by: user_name || "user",
           },
         }),
       }
@@ -37,17 +40,26 @@ export default async function handler(req, res) {
 
     if (!ghRes.ok) {
       const err = await ghRes.text();
-      await notifySlack(response_url, `:x: Failed to start GitHub Actions: ${err}`);
+      console.error("GitHub Actions trigger failed:", err);
+      await notifySlack(response_url, `:x: Failed to start bot: ${err}`);
+    } else {
+      console.log("GitHub Actions triggered successfully");
     }
   } catch (e) {
-    await notifySlack(response_url, `:x: Error triggering bot: ${e.message}`);
+    console.error("Error:", e.message);
+    await notifySlack(response_url, `:x: Error: ${e.message}`);
   }
 }
 
 async function notifySlack(url, text) {
-  await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ text }),
-  });
+  if (!url) return;
+  try {
+    await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text }),
+    });
+  } catch (e) {
+    console.error("Slack notify error:", e.message);
+  }
 }
