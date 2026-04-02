@@ -1,58 +1,42 @@
-# .github/workflows/book.yml
-# Triggered by Vercel when you type /book in Slack
-# Runs the full booking bot in GitHub's cloud
-
 name: BHEL Appointment Booking Bot
 
 on:
   workflow_dispatch:
     inputs:
       response_url:
-        description: "Slack response URL for sending messages back"
-        required: true
-      triggered_by:
-        description: "Slack username who triggered the bot"
+        description: Slack response URL
         required: false
-        default: "user"
+        default: ''
+      triggered_by:
+        description: Triggered by user
+        required: false
+        default: ''
 
 jobs:
   book:
     runs-on: ubuntu-latest
-    timeout-minutes: 120        # 2 hour max (checks every 1 hr as requested)
+    timeout-minutes: 135
 
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: '3.11'
 
       - name: Install dependencies
         run: |
-          pip install playwright plyer requests python-dotenv
+          pip install playwright requests
           playwright install chromium
           playwright install-deps chromium
 
-      - name: Notify Slack — bot started
-        run: |
-          curl -s -X POST "${{ github.event.inputs.response_url }}" \
-            -H "Content-Type: application/json" \
-            -d '{
-              "response_type": "in_channel",
-              "text": ":robot_face: *Bot is live!* Opening portal and sending OTP to your phone...\nTriggered by @${{ github.event.inputs.triggered_by }}"
-            }'
-
       - name: Run booking bot
         env:
-          MOBILE:            ${{ secrets.MOBILE }}
-          DOCTOR_SEARCH:     ${{ secrets.DOCTOR_SEARCH }}
-          SLACK_WEBHOOK:     ${{ secrets.SLACK_WEBHOOK }}
+          MOBILE:             ${{ secrets.MOBILE }}
+          DOCTOR_SEARCH:      ${{ secrets.DOCTOR_SEARCH }}
+          SLACK_WEBHOOK:      ${{ secrets.SLACK_WEBHOOK }}
           SLACK_RESPONSE_URL: ${{ github.event.inputs.response_url }}
-          GITHUB_TOKEN:      ${{ secrets.BOT_GITHUB_TOKEN }}
-          GITHUB_REPO:       ${{ github.repository }}
-          DRY_RUN:           "false"
-          POLL_INTERVAL:     "3600"          # check every 1 hour as requested
-          MAX_WAIT_HOURS:    "2"
+          GITHUB_TOKEN:       ${{ secrets.BOT_GITHUB_TOKEN }}
+          GITHUB_REPO:        ${{ github.repository }}
+          DRY_RUN:            ${{ secrets.DRY_RUN }}
         run: python book_appointment.py
