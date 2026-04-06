@@ -11,6 +11,10 @@ on:
         description: Triggered by user
         required: false
         default: ''
+      bot_mode:
+        description: Bot mode (start or check)
+        required: false
+        default: 'start'
 
 jobs:
   book:
@@ -30,13 +34,15 @@ jobs:
           playwright install chromium
           playwright install-deps chromium
 
-      - name: Run booking bot
+      - name: Run booking bot V2
         env:
-          MOBILE:             ${{ secrets.MOBILE }}
+          PORTAL_USERNAME:    ${{ secrets.PORTAL_USERNAME }}
+          PORTAL_PASSWORD:    ${{ secrets.PORTAL_PASSWORD }}
           DOCTOR_SEARCH:      ${{ secrets.DOCTOR_SEARCH }}
           SLACK_WEBHOOK:      ${{ secrets.SLACK_WEBHOOK }}
           SLACK_RESPONSE_URL: ${{ github.event.inputs.response_url }}
           GITHUB_TOKEN:       ${{ secrets.BOT_GITHUB_TOKEN }}
           GITHUB_REPO:        ${{ github.repository }}
           DRY_RUN:            ${{ secrets.DRY_RUN }}
-        run: python book_appointment.py
+          BOT_MODE:           ${{ github.event.inputs.bot_mode }}
+        run: python book_appointment_v2.py
