@@ -274,20 +274,35 @@ def select_target_date(page, day_str, mon_str):
         time.sleep(0.3)
         tabs  = page.locator("div.dottab")
         total = tabs.count()
+        log(f"Total date tabs: {total}")
         for i in range(total):
-            tab      = tabs.nth(i)
-            tab_text = tab.inner_text().strip()
-            if day_str in tab_text and mon_str in tab_text:
-                tab.click()
-                time.sleep(1)
-                log(f"Selected date: {tab_text}")
-                return tab_text
+            tab = tabs.nth(i)
+            try:
+                # Get only the text inside _wf-pp-daydate div — clean date text
+                day_div = tab.locator("div._wf-pp-daydate, div[class*='daydate'], div[class*='day']").first
+                if day_div.count() > 0:
+                    tab_text = day_div.inner_text().strip()
+                else:
+                    # Fallback: get first line of tab text only
+                    full_text = tab.inner_text().strip()
+                    tab_text  = full_text.split("\n")[0].strip()
+
+                log(f"Tab {i+1}: '{tab_text}'")
+                if day_str in tab_text and mon_str in tab_text:
+                    tab.click()
+                    time.sleep(1)
+                    date_label = f"{day_str} {mon_str}"
+                    log(f"Selected date tab {i+1}: {day_str} {mon_str}")
+                    return date_label
+            except Exception as e:
+                log(f"Tab {i+1} read error: {e}")
+                continue
+
         # Fallback to last tab
-        last_text = tabs.nth(total - 1).inner_text().strip()
         tabs.nth(total - 1).click()
         time.sleep(1)
-        log(f"Target not found — last tab: {last_text}")
-        return last_text
+        log(f"Target not found — clicked last tab")
+        return date_label
     except Exception as e:
         log(f"Date tab error: {e}")
         return date_label
