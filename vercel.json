@@ -1,17 +1,17 @@
 {
   "version": 2,
   "functions": {
-    "api/start.js":    { "maxDuration": 10 },
-    "api/check.js":    { "maxDuration": 10 },
-    "api/stop.js":     { "maxDuration": 10 },
-    "api/status.js":   { "maxDuration": 10 },
-    "api/otp.js":      { "maxDuration": 10 }
+    "api/start.js":   { "maxDuration": 10 },
+    "api/check.js":   { "maxDuration": 10 },
+    "api/orders.js":  { "maxDuration": 10 },
+    "api/stop.js":    { "maxDuration": 10 },
+    "api/status.js":  { "maxDuration": 10 }
   },
   "routes": [
-    { "src": "/start",     "dest": "/api/start.js"  },
-    { "src": "/check",     "dest": "/api/check.js"  },
-    { "src": "/stop",      "dest": "/api/stop.js"   },
-    { "src": "/botstatus", "dest": "/api/status.js" },
-    { "src": "/otp",       "dest": "/api/otp.js"    }
+    { "src": "/start",     "dest": "/api/start.js"   },
+    { "src": "/check",     "dest": "/api/check.js"   },
+    { "src": "/orders",    "dest": "/api/orders.js"  },
+    { "src": "/stop",      "dest": "/api/stop.js"    },
+    { "src": "/botstatus", "dest": "/api/status.js"  }
   ]
 }
