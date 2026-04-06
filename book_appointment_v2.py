@@ -1,25 +1,14 @@
 """
 BHEL KarExpert — Booking Bot V2
-=================================
 Login   : Username + Password (fully automatic)
 Date    : Today + 7 days IST
-Slots   : Preferred: 10:00, 10:30, 11:00, 04:30, 05:00, 05:30 → any
-Mode    : START (morning polling) or CHECK (instant check)
-
-START mode — poll schedule:
-  6:50–6:59 AM IST → every 10s (portal not open yet)
-  7:00–7:20 AM IST → every 2s  (flash sale window)
-  7:20–7:30 AM IST → every 10s (wind down)
-  7:30 AM IST      → auto stop
-
-CHECK mode — instant:
-  Login → check once → book if available → report → done
+Slots   : Preferred: 10:00, 10:30, 11:00, 04:30, 05:00, 05:30
+Modes   : start | check | orders
 """
 
-import os, time, requests, traceback
+import os, time, requests, traceback, re
 from datetime import datetime, timezone, timedelta
 
-# ── Config ──────────────────────────────────────────────────────────────────
 PORTAL_USERNAME    = os.environ.get("PORTAL_USERNAME", "")
 PORTAL_PASSWORD    = os.environ.get("PORTAL_PASSWORD", "")
 DOCTOR_SEARCH      = os.environ.get("DOCTOR_SEARCH", "Dr S Kamal Kumar")
@@ -28,19 +17,18 @@ SLACK_RESPONSE_URL = os.environ.get("SLACK_RESPONSE_URL", "")
 GITHUB_TOKEN       = os.environ.get("GITHUB_TOKEN", "")
 GITHUB_REPO        = os.environ.get("GITHUB_REPO", "")
 DRY_RUN            = os.environ.get("DRY_RUN", "false").lower() == "true"
-BOT_MODE           = os.environ.get("BOT_MODE", "start").lower()  # "start" or "check"
+BOT_MODE           = os.environ.get("BOT_MODE", "start").lower()
 
 LOGIN_URL          = "https://bhel.karexpert.com/account-management/login"
 BOOKING_URL        = "https://bhel.karexpert.com/appointment/searchdoctor/searchdepartment/general/cleardate"
 ORDER_URL          = "https://bhel.karexpert.com/order/my_orders_format/orderList"
 
-# Slot preference order
 PREFERRED_SLOTS    = ["10:00 AM", "10:30 AM", "11:00 AM", "04:30 PM", "05:00 PM", "05:30 PM"]
-
-# Colors
 WHITE_BORDER       = "rgb(184, 233, 134)"
+FAST_POLL          = 2
+SLOW_POLL          = 10
+D                  = "\u2500" * 40
 
-# ── IST helpers ─────────────────────────────────────────────────────────────
 def get_ist():
     return datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)
 
@@ -49,29 +37,22 @@ def past_stop_time():
     return ist.hour > 7 or (ist.hour == 7 and ist.minute >= 30)
 
 def get_poll_interval():
-    """
-    6:50–6:59 AM → 10s
-    7:00–7:20 AM → 2s  (peak)
-    7:20–7:30 AM → 10s
-    """
     ist = get_ist()
     h, m = ist.hour, ist.minute
     if h == 7 and m < 20:
-        return 2    # peak window
-    return 10       # all other times
+        return FAST_POLL
+    return SLOW_POLL
 
 def get_target_date():
-    ist      = get_ist()
-    target   = ist + timedelta(days=7)
-    day_str  = target.strftime("%-d")
-    mon_str  = target.strftime("%b")
-    full_str = target.strftime("%d %b %Y")
-    return target, day_str, mon_str, full_str
+    ist     = get_ist()
+    target  = ist + timedelta(days=7)
+    day_str = target.strftime("%-d")
+    mon_str = target.strftime("%b")
+    full    = target.strftime("%d %b %Y")
+    return target, day_str, mon_str, full
 
-# ── Slack ────────────────────────────────────────────────────────────────────
-def slack(text, emoji=""):
-    msg = f"{emoji} {text}".strip() if emoji else text
-    payload = {"response_type": "in_channel", "text": msg}
+def slack(text):
+    payload = {"response_type": "in_channel", "text": text}
     for url in [SLACK_RESPONSE_URL, SLACK_WEBHOOK]:
         if url:
             try:
@@ -80,30 +61,20 @@ def slack(text, emoji=""):
                     break
             except Exception:
                 continue
-    print(f"[SLACK] {msg[:120]}", flush=True)
+    print(f"[SLACK] {text[:80]}", flush=True)
 
 def log(msg):
     ist = get_ist()
     print(f"[{ist.strftime('%H:%M:%S')} IST] {msg}", flush=True)
 
-# ── Slot detection ───────────────────────────────────────────────────────────
 def find_available_slots(page):
-    """
-    WHITE pill = border:rgb(184,233,134), no background, no not-allowed → BOOK
-    ORANGE pill = border:rgb(251,144,38) → fallback
-    Returns sorted by PREFERRED_SLOTS order
-    """
     all_btns     = page.locator("button._wf-pp-timebox")
     white_slots  = {}
     orange_slots = {}
-    count        = all_btns.count()
-
-    for i in range(count):
+    for i in range(all_btns.count()):
         btn = all_btns.nth(i)
         try:
-            if not btn.is_visible():
-                continue
-            if btn.is_disabled():
+            if not btn.is_visible() or btn.is_disabled():
                 continue
             style   = btn.get_attribute("style") or ""
             classes = btn.get_attribute("class") or ""
@@ -114,31 +85,25 @@ def find_available_slots(page):
             text = btn.inner_text().strip()
             if not text:
                 continue
-            has_green_border = WHITE_BORDER in style
-            has_background   = "background:" in style or "background-color:" in style
-            if has_green_border and not has_background:
+            has_border = WHITE_BORDER in style
+            has_bg     = "background:" in style or "background-color:" in style
+            if has_border and not has_bg:
                 white_slots[text] = btn
             elif "rgb(251, 144, 38)" in style or "rgb(255, 165, 0)" in style:
                 orange_slots[text] = btn
         except Exception:
             continue
-
-    available = white_slots if white_slots else orange_slots
-    if not available:
-        return []
-
+    pool   = white_slots if white_slots else orange_slots
     result = []
-    for pref in PREFERRED_SLOTS:
-        if pref in available:
-            result.append((available[pref], pref))
-    for text, btn in available.items():
-        if text not in PREFERRED_SLOTS:
-            result.append((btn, text))
+    for p in PREFERRED_SLOTS:
+        if p in pool:
+            result.append((pool[p], p))
+    for t, b in pool.items():
+        if t not in PREFERRED_SLOTS:
+            result.append((b, t))
     return result
 
-# ── Login ─────────────────────────────────────────────────────────────────────
 def do_login(page):
-    log("Opening login page ...")
     page.goto(LOGIN_URL, wait_until="networkidle", timeout=30000)
     try:
         page.wait_for_selector("ngx-spinner", state="hidden", timeout=10000)
@@ -149,259 +114,172 @@ def do_login(page):
     except Exception:
         pass
     time.sleep(2)
-
-    # Enter username
-    for selector in [
-        'input[formcontrolname="loginId"]',
-        'input[formcontrolname="username"]',
-        'input[placeholder*="Login" i]',
-        'input[placeholder*="User" i]',
-        'input[type="text"]',
-    ]:
+    for sel in ['input[formcontrolname="loginId"]', 'input[formcontrolname="username"]',
+                'input[placeholder*="Login" i]', 'input[type="text"]']:
         try:
-            el = page.locator(selector).first
+            el = page.locator(sel).first
             if el.is_visible(timeout=2000):
                 el.click()
                 el.fill(PORTAL_USERNAME)
-                log(f"Username filled via {selector}")
                 break
         except Exception:
             continue
-
-    # Enter password
-    for selector in [
-        'input[type="password"]',
-        'input[formcontrolname="password"]',
-        'input[placeholder*="Password" i]',
-    ]:
+    for sel in ['input[type="password"]', 'input[formcontrolname="password"]']:
         try:
-            el = page.locator(selector).first
+            el = page.locator(sel).first
             if el.is_visible(timeout=2000):
                 el.click()
                 el.fill(PORTAL_PASSWORD)
-                log(f"Password filled via {selector}")
                 break
         except Exception:
             continue
     time.sleep(0.5)
-
-    # Click Login
-    for selector in ["button.login-button", "button.btn-gradient", "button[type='submit']"]:
+    for sel in ["button.login-button", "button.btn-gradient", "button[type='submit']"]:
         try:
-            el = page.locator(selector).first
+            el = page.locator(sel).first
             if el.is_visible(timeout=2000):
                 el.click()
-                log(f"Login clicked via {selector}")
                 break
         except Exception:
             continue
-
-    # Confirm login via DOM
-    for selector in ["app-header", "app-sidebar", "app-base", "app-dynamic-dashboard"]:
+    for sel in ["app-header", "app-sidebar", "app-base", "app-dynamic-dashboard"]:
         try:
-            page.wait_for_selector(selector, timeout=15000)
-            log(f"Login confirmed: {selector}")
+            page.wait_for_selector(sel, timeout=15000)
+            log(f"Login confirmed: {sel}")
             return True
         except Exception:
             continue
-
-    # Fallback: poll URL
     for i in range(10):
         time.sleep(2)
         if "dynamic_dashboard" in page.url:
             log("Login confirmed via URL")
             return True
-
-    log("Login optimistic continue ...")
     return True
 
-# ── Navigate to doctor slot page ──────────────────────────────────────────────
 def navigate_to_doctor(page):
-    log("Navigating to booking page ...")
     page.goto(BOOKING_URL, wait_until="networkidle", timeout=30000)
     time.sleep(3)
-
     if "login" in page.url and "dynamic" not in page.url:
-        raise Exception("Session expired — redirected to login")
-
-    # Find Dr S Kamal Kumar
-    log("Finding Dr S Kamal Kumar ...")
+        raise Exception("Session expired")
     page.wait_for_selector("div#doctor-card", timeout=15000)
     time.sleep(1)
     cards = page.locator("div#doctor-card")
-    total = cards.count()
-    log(f"Found {total} doctor cards")
-
     found = False
-    for i in range(total):
+    for i in range(cards.count()):
         card = cards.nth(i)
         try:
             if "Kamal Kumar" in (card.inner_text() or ""):
-                log(f"Dr S Kamal Kumar at card {i+1}")
                 card.scroll_into_view_if_needed()
                 time.sleep(0.5)
-                for btn_sel in [
-                    "button.primary-btn.disabledBookBtn",
-                    "button.primary-btn",
-                    "button[class*='primary-btn']",
-                ]:
+                for bs in ["button.primary-btn.disabledBookBtn", "button.primary-btn"]:
                     try:
-                        btn = card.locator(btn_sel).first
+                        btn = card.locator(bs).first
                         if btn.is_visible(timeout=3000):
                             btn.click()
                             found = True
-                            log(f"Clicked Book Appointment via {btn_sel}")
                             break
                     except Exception:
                         continue
                 if found:
                     break
-        except Exception as e:
-            log(f"Card {i+1}: {e}")
-
+        except Exception:
+            continue
     if not found:
-        log("Fallback: first primary-btn ...")
         page.locator("button.primary-btn").first.click()
-
     time.sleep(2)
     return page.url
 
-# ── Select target date ────────────────────────────────────────────────────────
 def select_target_date(page, day_str, mon_str):
-    date_label = f"{day_str} {mon_str}"
     try:
         page.wait_for_selector("div.dottab", timeout=8000)
         time.sleep(0.3)
         tabs  = page.locator("div.dottab")
         total = tabs.count()
-        log(f"Total date tabs: {total}")
         for i in range(total):
             tab = tabs.nth(i)
             try:
-                # Get only the text inside _wf-pp-daydate div — clean date text
-                day_div = tab.locator("div._wf-pp-daydate, div[class*='daydate'], div[class*='day']").first
-                if day_div.count() > 0:
-                    tab_text = day_div.inner_text().strip()
-                else:
-                    # Fallback: get first line of tab text only
-                    full_text = tab.inner_text().strip()
-                    tab_text  = full_text.split("\n")[0].strip()
-
-                log(f"Tab {i+1}: '{tab_text}'")
-                if day_str in tab_text and mon_str in tab_text:
+                full_text = tab.inner_text().strip()
+                first_line = full_text.split("\n")[0].strip()
+                if day_str in first_line and mon_str in first_line:
                     tab.click()
                     time.sleep(1)
-                    date_label = f"{day_str} {mon_str}"
-                    log(f"Selected date tab {i+1}: {day_str} {mon_str}")
-                    return date_label
-            except Exception as e:
-                log(f"Tab {i+1} read error: {e}")
+                    return f"{day_str} {mon_str}"
+            except Exception:
                 continue
-
-        # Fallback to last tab
         tabs.nth(total - 1).click()
         time.sleep(1)
-        log(f"Target not found — clicked last tab")
-        return date_label
     except Exception as e:
-        log(f"Date tab error: {e}")
-        return date_label
+        log(f"Date tab: {e}")
+    return f"{day_str} {mon_str}"
 
-# ── Book slot ────────────────────────────────────────────────────────────────
-def book_slot(page, chosen_btn, chosen_time):
-    chosen_btn.click()
+def book_slot(page, btn, slot_time):
+    btn.click()
     time.sleep(2)
-    log("Waiting for cart ...")
     try:
         page.wait_for_selector("kx-cart", timeout=10000)
-        log("Cart appeared!")
     except Exception:
-        log("Cart timeout — confirming anyway ...")
+        pass
     time.sleep(1)
-
     confirmed = False
-    for selector in ["div._wf-pp-bookappointmentdivx2", "._wf-pp-bookappointmentdivx2"]:
+    for sel in ["div._wf-pp-bookappointmentdivx2", "._wf-pp-bookappointmentdivx2"]:
         try:
-            el = page.locator(selector).first
+            el = page.locator(sel).first
             if el.is_visible(timeout=5000):
                 el.click()
                 confirmed = True
-                log(f"Confirmed via {selector}")
                 break
         except Exception:
             continue
-
     if not confirmed:
-        for label in ["Book Appointment", "Confirm", "Book", "Submit", "OK"]:
+        for label in ["Book Appointment", "Confirm", "Book"]:
             try:
                 cb = page.get_by_role("button", name=label, exact=False).first
                 if cb.is_visible(timeout=3000):
                     cb.click()
                     confirmed = True
-                    log(f"Confirmed via '{label}'")
                     break
             except Exception:
                 continue
-
     page.wait_for_load_state("networkidle", timeout=15000)
     return confirmed
 
-# ── Send success Slack message ────────────────────────────────────────────────
-def send_success_slack(date_label, chosen_time, confirmed):
+def send_booked_slack(date_label, slot_time):
     ist = get_ist()
     slack(
-        f"*Appointment Successfully Booked!* :white_check_mark:\n\n"
-        f">  *Doctor:*    Dr S Kamal Kumar\n"
-        f">  *Specialty:* General Physician\n"
-        f">  *Date:*      {date_label}\n"
-        f">  *Slot:*      {chosen_time}\n"
-        f">  *Room:*      OPD PHY 2 | First Floor\n"
-        f">  *Type:*      OP (Outpatient)\n"
-        f">  *Booked at:* {ist.strftime('%d-%b-%Y %H:%M:%S')} IST\n"
-        f">  *Status:*    Booked ✅\n"
-        f">  *Payment:*   Successful ✅\n\n"
-        f"_View: bhel.karexpert.com/order/my_orders_format/orderList_",
-        ":hospital:"
+        f":white_check_mark:  *Appointment Booked Successfully!*\n"
+        f"{D}\n"
+        f":male-doctor:  *Doctor*       :  Dr S Kamal Kumar\n"
+        f":stethoscope:  *Specialty*    :  General Physician\n"
+        f":round_pushpin:  *Room*          :  OPD PHY 2  |  First Floor\n"
+        f":calendar:  *Date*         :  {date_label}\n"
+        f":clock1:  *Slot*         :  {slot_time}\n"
+        f":clipboard:  *Type*         :  OP (Outpatient)\n"
+        f":white_check_mark:  *Status*       :  Booked\n"
+        f":credit_card:  *Payment*      :  Successful\n"
+        f":stopwatch:  *Booked at*    :  {ist.strftime('%d %b %Y  %H:%M:%S')} IST\n"
+        f"{D}"
     )
 
-# ── MODE 1: START — morning polling ──────────────────────────────────────────
 def run_start_mode(page, doctor_url, day_str, mon_str, full_date):
-    target, _, _, _ = get_target_date()
-    ist  = get_ist()
-    poll = get_poll_interval()
-
-    slack(
-        f":mag: *Bot watching for slots!* (START mode)\n"
-        f">  Target date: *{full_date}*\n"
-        f">  IST now: *{ist.strftime('%H:%M:%S')}*\n"
-        f">  Poll: *10s → 2s (7:00 AM) → 10s (7:20 AM)*\n"
-        f">  Preferred: 10:00 → 10:30 → 11:00 → 04:30 → 05:00 → 05:30\n"
-        f">  Auto-stop: *7:30 AM IST*",
-        ":clock630:"
-    )
-
     attempt        = 0
     prev_tab_count = 0
-
     while True:
         attempt += 1
-
         if past_stop_time():
             ist = get_ist()
             slack(
-                f":stopwatch: *7:30 AM IST — bot stopping.*\n"
-                f">  No slot found today.\n"
-                f">  IST: {ist.strftime('%H:%M:%S')}\n"
-                f">  Try `/check` later or `/start` tomorrow at 6:50 AM",
-                ":x:"
+                f":stopwatch:  *Bot Stopped — 7:30 AM IST*\n"
+                f"{D}\n"
+                f":calendar:  *Date*        :  {full_date}\n"
+                f":clock730:  *Stopped at*  :  {ist.strftime('%H:%M:%S')} IST\n"
+                f":x:  *Result*       :  No slot found today\n"
+                f"{D}\n"
+                f"_Try `/start` tomorrow at 6:50 AM IST_"
             )
-            log("7:30 AM IST — stopping")
             break
-
         poll = get_poll_interval()
         ist  = get_ist()
-        log(f"── Attempt {attempt} | {ist.strftime('%H:%M:%S')} IST | poll:{poll}s ──")
-
+        log(f"Attempt {attempt} | {ist.strftime('%H:%M:%S')} IST | {poll}s")
         try:
             page.goto(doctor_url, wait_until="networkidle", timeout=20000)
             time.sleep(1)
@@ -409,295 +287,220 @@ def run_start_mode(page, doctor_url, day_str, mon_str, full_date):
             log(f"Reload: {e}")
             time.sleep(poll)
             continue
-
-        # Select date
         try:
             page.wait_for_selector("div.dottab", timeout=8000)
             time.sleep(0.3)
             tabs       = page.locator("div.dottab")
             total_tabs = tabs.count()
-
             if total_tabs > prev_tab_count and prev_tab_count > 0:
-                slack(f":tada: *New date tab added!* Now {total_tabs} dates available!", "")
-
+                slack(
+                    f":tada:  *New Date Unlocked!*\n"
+                    f"{D}\n"
+                    f":calendar:  Portal now shows *{total_tabs}* dates\n"
+                    f":zap:  Checking new slots *immediately*\n"
+                    f"{D}"
+                )
             prev_tab_count = total_tabs
-            date_label     = select_target_date(page, day_str, mon_str)
+            date_label = select_target_date(page, day_str, mon_str)
         except Exception as e:
             log(f"Date: {e}")
             date_label = full_date
-
-        # Check slots
         slots = find_available_slots(page)
         log(f"Slots on {date_label}: {[s[1] for s in slots] if slots else 'none'}")
-
         if not slots:
             time.sleep(poll)
             continue
-
-        # Book it!
         chosen_btn, chosen_time = slots[0]
-        ist = get_ist()
-        log(f"SLOT FOUND: {chosen_time} on {date_label}")
-
         if DRY_RUN:
             slack(
-                f":test_tube: *[DRY RUN]* Slot found!\n"
-                f">  Date: *{date_label}* | Time: *{chosen_time}*\n"
-                f"_DRY_RUN=true — NOT booked._", ":eyes:"
+                f":test_tube:  *DRY RUN \u2014 Slot Found!*\n"
+                f"{D}\n"
+                f":calendar:  *Date*   :  {date_label}\n"
+                f":clock1:  *Slot*   :  {chosen_time}\n"
+                f":x:  *Action*  :  NOT booked (DRY_RUN=true)\n"
+                f"{D}\n"
+                f"_Set DRY_RUN=false in GitHub Secrets to go live_"
             )
             break
-
-        slack(f":zap: *Slot found!* {chosen_time} on {date_label} — booking now!", ":tada:")
-        confirmed = book_slot(page, chosen_btn, chosen_time)
-        send_success_slack(date_label, chosen_time, confirmed)
-        log("DONE — Appointment booked!")
+        slack(
+            f":zap:  *Slot Found \u2014 Booking Now!*\n"
+            f"{D}\n"
+            f":calendar:  *Date*   :  {date_label}\n"
+            f":clock1:  *Slot*   :  {chosen_time}\n"
+            f"{D}"
+        )
+        book_slot(page, chosen_btn, chosen_time)
+        send_booked_slack(date_label, chosen_time)
         break
 
-# ── MODE 2: CHECK — instant check ────────────────────────────────────────────
 def run_check_mode(page, doctor_url, day_str, mon_str, full_date):
-    ist = get_ist()
-    log(f"CHECK mode | {full_date} | {ist.strftime('%H:%M:%S')} IST")
-
     try:
         page.goto(doctor_url, wait_until="networkidle", timeout=20000)
         time.sleep(1)
     except Exception as e:
-        slack(f":x: Could not reload page: {e}")
+        slack(f":x: Could not load page: {e}")
         return
-
     date_label = select_target_date(page, day_str, mon_str)
     slots      = find_available_slots(page)
-
-    log(f"CHECK mode — slots on {date_label}: {[s[1] for s in slots] if slots else 'none'}")
-
+    ist        = get_ist()
+    log(f"CHECK | {date_label}: {[s[1] for s in slots] if slots else 'none'}")
     if not slots:
         slack(
-            f":calendar: *No slots available right now.*\n"
-            f">  Date checked: *{date_label}*\n"
-            f">  IST: {ist.strftime('%H:%M:%S')}\n"
-            f">  Try `/start` at 6:50 AM tomorrow for fresh slots\n"
-            f">  Or try `/check` again later",
-            ":x:"
+            f":x:  *No Slots Available*\n"
+            f"{D}\n"
+            f":male-doctor:  *Doctor*    :  Dr S Kamal Kumar\n"
+            f":calendar:  *Date*      :  {date_label}\n"
+            f":clock1:  *Checked*   :  {ist.strftime('%d %b %Y  %H:%M')} IST\n"
+            f"{D}\n"
+            f"_Use `/start` at 6:50 AM for fresh morning slots_"
         )
         return
-
-    # Slot found — book it!
     chosen_btn, chosen_time = slots[0]
-    log(f"CHECK: Slot found: {chosen_time}")
-
     if DRY_RUN:
         slack(
-            f":test_tube: *[DRY RUN]* Slot found!\n"
-            f">  Date: *{date_label}* | Time: *{chosen_time}*\n"
-            f"_DRY_RUN=true — NOT booked._", ":eyes:"
+            f":test_tube:  *DRY RUN \u2014 Slot Found!*\n"
+            f"{D}\n"
+            f":calendar:  *Date*   :  {date_label}\n"
+            f":clock1:  *Slot*   :  {chosen_time}\n"
+            f":x:  *Action*  :  NOT booked (DRY_RUN=true)\n"
+            f"{D}\n"
+            f"_Set DRY_RUN=false in GitHub Secrets to go live_"
         )
         return
+    slack(
+        f":zap:  *Slot Found \u2014 Booking Now!*\n"
+        f"{D}\n"
+        f":calendar:  *Date*   :  {date_label}\n"
+        f":clock1:  *Slot*   :  {chosen_time}\n"
+        f"{D}"
+    )
+    book_slot(page, chosen_btn, chosen_time)
+    send_booked_slack(date_label, chosen_time)
 
-    slack(f":zap: *Slot found!* {chosen_time} on {date_label} — booking now!", ":tada:")
-    confirmed = book_slot(page, chosen_btn, chosen_time)
-    send_success_slack(date_label, chosen_time, confirmed)
-    log("CHECK mode — DONE!")
-
-# ── MODE 3: ORDERS — view upcoming appointments ──────────────────────────────
 def parse_appointment(raw_text):
-    """
-    Parse raw appointment text into clean structured dict.
-    Looks for: doctor name, date, time, token, UHID, status
-    """
     appt = {
         "doctor":   "Dr S Kamal Kumar",
         "specialty":"General Physician",
-        "room":     "OPD PHY 2",
-        "floor":    "First Floor",
-        "date":     "",
-        "time":     "",
-        "token":    "",
-        "uhid":     "",
-        "status":   "Booked",
-        "payment":  "Successful",
+        "room":     "OPD PHY 2  |  First Floor",
+        "date":     "", "time":   "",
+        "token":    "", "uhid":   "",
+        "status":   "Booked", "payment": "Successful",
     }
-
-    lines = [l.strip() for l in raw_text.replace("|", "\n").split("\n") if l.strip()]
-
-    for line in lines:
-        line_lower = line.lower()
-        # Date & time — pattern: dd/mm/yyyy hh:mm am/pm
-        import re
-        dt_match = re.search(r"(\d{2}/\d{2}/\d{4})\s+(\d{1,2}:\d{2}\s*(?:am|pm))", line, re.IGNORECASE)
-        if dt_match:
-            raw_date = dt_match.group(1)  # 13/04/2026
-            raw_time = dt_match.group(2).strip()  # 06:00 pm
-            try:
-                from datetime import datetime as dt
-                d = dt.strptime(raw_date, "%d/%m/%Y")
-                appt["date"] = d.strftime("%d %b %Y")  # 13 Apr 2026
-            except Exception:
-                appt["date"] = raw_date
-            appt["time"] = raw_time.upper()  # 06:00 PM
-
-        # Token number
-        token_match = re.search(r"token\s*(?:no\.?|number|#)?\s*[:\-]?\s*(\d+)", line, re.IGNORECASE)
-        if token_match:
-            appt["token"] = token_match.group(1)
-
-        # UHID
-        uhid_match = re.search(r"UHID[/\s]+(\w+)", line, re.IGNORECASE)
-        if uhid_match:
-            appt["uhid"] = uhid_match.group(1)
-
-        # Status
-        if "pending" in line_lower:
-            appt["status"] = "Pending"
-        elif "booked" in line_lower:
-            appt["status"] = "Booked"
-        elif "completed" in line_lower:
-            appt["status"] = "Completed"
-        elif "cancelled" in line_lower:
-            appt["status"] = "Cancelled"
-
+    dt_match = re.search(r"(\d{2}/\d{2}/\d{4})\s+(\d{1,2}:\d{2}\s*(?:am|pm))", raw_text, re.IGNORECASE)
+    if dt_match:
+        try:
+            d = datetime.strptime(dt_match.group(1), "%d/%m/%Y")
+            appt["date"] = d.strftime("%d %b %Y")
+        except Exception:
+            appt["date"] = dt_match.group(1)
+        appt["time"] = dt_match.group(2).strip().upper()
+    t = re.search(r"token\s*(?:no\.?)?\s*[:\-]?\s*(\d+)", raw_text, re.IGNORECASE)
+    if t:
+        appt["token"] = t.group(1)
+    u = re.search(r"UHID[/\s]+(\w+)", raw_text, re.IGNORECASE)
+    if u:
+        appt["uhid"] = u.group(1)
+    for s in ["Completed", "Booked", "Pending", "Cancelled"]:
+        if s.lower() in raw_text.lower():
+            appt["status"] = s
+            break
     return appt
 
-
-def format_appointment_slack(appt, index=1):
-    """Format a single appointment as premium Slack message block."""
-    status_icon = {
-        "Booked":    ":white_check_mark:",
-        "Pending":   ":hourglass:",
-        "Completed": ":ballot_box_with_check:",
-        "Cancelled": ":x:",
-    }.get(appt["status"], ":white_check_mark:")
-
-    token_line = f"\n>  :ticket:  *Token No:*    {appt['token']}" if appt["token"] else ""
-    uhid_line  = f"\n>  :id:  *UHID:*         {appt['uhid']}"     if appt["uhid"]  else ""
-    date_line  = f"\n>  :calendar:  *Date:*         {appt['date']}" if appt["date"]  else ""
-    time_line  = f"\n>  :clock6:  *Time:*         {appt['time']}"  if appt["time"]  else ""
-
-    return (
-        f":hospital: *Appointment #{index}*\n"
-        f"{'─' * 30}\n"
-        f">  :male-doctor:  *Doctor:*       {appt['doctor']}\n"
-        f">  :stethoscope:  *Specialty:*    {appt['specialty']}\n"
-        f">  :round_pushpin:  *Room:*          {appt['room']} | {appt['floor']}"
-        f"{date_line}{time_line}{token_line}{uhid_line}\n"
-        f">  {status_icon}  *Status:*       {appt['status']}\n"
-        f">  :credit_card:  *Payment:*      {appt['payment']}\n"
-        f"{'─' * 30}"
-    )
-
-
 def run_orders_mode(page):
-    """Login → orders page → parse → send premium Slack message."""
     ist = get_ist()
-    log("Orders mode — navigating to order list ...")
-
+    log("Orders mode ...")
     try:
         page.goto(ORDER_URL, wait_until="networkidle", timeout=20000)
         time.sleep(2)
-
         if "login" in page.url and "dynamic" not in page.url:
-            slack(":x: Session expired. Try `/orders` again.", "")
+            slack(":x: Session expired. Try `/orders` again.")
             return
-
-        log(f"Orders page loaded: {page.url}")
-
-        # Get full page text
-        raw_text = ""
-        try:
-            raw_text = page.locator("body").inner_text()
-            log(f"Page text length: {len(raw_text)}")
-        except Exception as e:
-            log(f"Body text: {e}")
-
+        raw = page.locator("body").inner_text()
         ist = get_ist()
-
-        # Check if any appointment data exists
-        has_data = any(kw in raw_text for kw in [
-            "Kamal Kumar", "GENERAL PHYSICIAN", "OPD PHY",
-            "06:00", "Token", "UHID", "Booked", "Pending"
-        ])
-
+        has_data = any(k in raw for k in ["Kamal Kumar", "GENERAL PHYSICIAN", "Token", "UHID", "Booked", "Pending"])
         if has_data:
-            appt  = parse_appointment(raw_text)
-            msg   = format_appointment_slack(appt, index=1)
+            a = parse_appointment(raw)
+            token_line  = f"\n:ticket:  *Token No*      :  {a['token']}" if a["token"] else ""
+            uhid_line   = f"\n:id:  *UHID*          :  {a['uhid']}"     if a["uhid"]  else ""
+            date_line   = f"\n:calendar:  *Date*          :  {a['date']}" if a["date"]  else ""
+            time_line   = f"\n:clock1:  *Time*          :  {a['time']}"  if a["time"]  else ""
+            status_icon = {"Booked": ":white_check_mark:", "Completed": ":ballot_box_with_check:",
+                           "Pending": ":hourglass:", "Cancelled": ":x:"}.get(a["status"], ":white_check_mark:")
             slack(
-                f"*Your Upcoming Appointments* :clipboard:\n\n"
-                f"{msg}\n\n"
-                f"_Checked: {ist.strftime('%d %b %Y, %H:%M:%S')} IST_",
-                ""
+                f":clipboard:  *Your Upcoming Appointment*\n"
+                f"{D}\n"
+                f":male-doctor:  *Doctor*        :  {a['doctor']}\n"
+                f":stethoscope:  *Specialty*     :  {a['specialty']}\n"
+                f":round_pushpin:  *Room*           :  {a['room']}"
+                f"{date_line}{time_line}{token_line}{uhid_line}\n"
+                f"{status_icon}  *Status*        :  {a['status']}\n"
+                f":credit_card:  *Payment*       :  {a['payment']}\n"
+                f"{D}\n"
+                f"_Checked: {ist.strftime('%d %b %Y, %H:%M:%S')} IST_"
             )
         else:
             slack(
-                f":calendar: *No upcoming appointments found*\n\n"
-                f">  No bookings at this time\n"
-                f">  Use `/check` to book a new slot\n\n"
-                f"_Checked: {ist.strftime('%d %b %Y, %H:%M:%S')} IST_",
-                ""
+                f":calendar:  *No Upcoming Appointments*\n"
+                f"{D}\n"
+                f":x:  No bookings found at this time\n"
+                f":mag:  Use `/check` to book a new slot\n"
+                f"{D}\n"
+                f"_Checked: {ist.strftime('%d %b %Y, %H:%M:%S')} IST_"
             )
-
-        log("Orders mode done!")
-
     except Exception as e:
         log(f"Orders error: {e}")
-        slack(
-            f":x: Could not fetch appointments.\n"
-            f"View directly: bhel.karexpert.com/order/my_orders_format/orderList",
-            ""
-        )
+        slack(f":x: Could not fetch appointments. Please try again.")
 
-
-# ── Main ──────────────────────────────────────────────────────────────────────
 def run():
     from playwright.sync_api import sync_playwright
-
-    ist                          = get_ist()
+    ist                         = get_ist()
     target, day_str, mon_str, full_date = get_target_date()
-    mode                         = BOT_MODE
-
-    log(f"Bot V2 | Mode: {mode.upper()} | IST: {ist.strftime('%H:%M:%S')} | Target: {full_date}")
+    mode                        = BOT_MODE
+    log(f"V2 | Mode:{mode} | IST:{ist.strftime('%H:%M:%S')} | Target:{full_date}")
 
     if mode == "start":
         slack(
-            f":rocket: *BHEL Bot started!*\n"
-            f">  Doctor: *{DOCTOR_SEARCH}*\n"
-            f">  Target: *{full_date}*\n"
-            f">  Watching slots from *6:50 AM IST*\n"
-            f">  Auto-stop: *7:30 AM IST*",
-            ""
+            f":rocket:  *BHEL Appointment Bot*\n"
+            f"{D}\n"
+            f":male-doctor:  *Doctor*          :  Dr S Kamal Kumar\n"
+            f":stethoscope:  *Specialty*       :  General Physician\n"
+            f":calendar:  *Target Date*     :  {full_date}\n"
+            f"{D}\n"
+            f":clock630:  Watching from *6:50 AM IST*  |  Auto-stop: *7:30 AM IST*\n"
+            f"{D}"
         )
     elif mode == "check":
         slack(
-            f":mag: *Checking slots for {full_date}...*",
-            ""
+            f":mag:  *BHEL Appointment Bot*\n"
+            f"{D}\n"
+            f":male-doctor:  *Doctor*          :  Dr S Kamal Kumar\n"
+            f":stethoscope:  *Specialty*       :  General Physician\n"
+            f":calendar:  *Target Date*     :  {full_date}\n"
+            f"{D}\n"
+            f":clock1:  Instant check — book if available\n"
+            f"{D}"
         )
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         ctx     = browser.new_context(viewport={"width": 1280, "height": 800})
         page    = ctx.new_page()
-
-        # Login
         log("Logging in ...")
         do_login(page)
         ist = get_ist()
-        if mode == "start":
-            slack(f":white_check_mark: *Logged in!* Watching for slots...", "")
-
-        # Orders mode — go directly to orders, no doctor navigation needed
+        if mode in ["start", "check"]:
+            slack(f":white_check_mark:  *Logged in!*  |  IST: {ist.strftime('%H:%M:%S')}")
         if mode == "orders":
             run_orders_mode(page)
         else:
-            # Navigate to doctor for check/start modes
             doctor_url = navigate_to_doctor(page)
             log(f"Doctor page: {doctor_url}")
-
             if mode == "check":
                 run_check_mode(page, doctor_url, day_str, mon_str, full_date)
             else:
                 run_start_mode(page, doctor_url, day_str, mon_str, full_date)
-
         browser.close()
         log("Done.")
-
 
 if __name__ == "__main__":
     try:
@@ -706,6 +509,8 @@ if __name__ == "__main__":
         err = traceback.format_exc()
         log(f"CRASH:\n{err}")
         slack(
-            f"*Bot V2 crashed!* :rotating_light:\n```{err[-800:]}```\n"
-            f"_Type `/start` or `/check` to retry._", ":x:"
+            f":rotating_light:  *Bot Crashed*\n"
+            f"DIVIDER\n"
+            f"```{err[-600:]}```\n"
+            f"_Type `/start` or `/check` to retry._"
         )
