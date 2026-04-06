@@ -456,13 +456,7 @@ def run_start_mode(page, doctor_url, day_str, mon_str, full_date):
 # ── MODE 2: CHECK — instant check ────────────────────────────────────────────
 def run_check_mode(page, doctor_url, day_str, mon_str, full_date):
     ist = get_ist()
-    slack(
-        f":mag: *Checking slots now!* (CHECK mode)\n"
-        f">  Target date: *{full_date}*\n"
-        f">  IST now: *{ist.strftime('%H:%M:%S')}*\n"
-        f">  Checking once — book if available, report if not.",
-        ":clock1:"
-    )
+    log(f"CHECK mode | {full_date} | {ist.strftime('%H:%M:%S')} IST")
 
     try:
         page.goto(doctor_url, wait_until="networkidle", timeout=20000)
@@ -628,15 +622,14 @@ def run_orders_mode(page):
             slack(
                 f"*Your Upcoming Appointments* :clipboard:\n\n"
                 f"{msg}\n\n"
-                f"_Checked: {ist.strftime('%d %b %Y, %H:%M:%S')} IST_\n"
-                f"_Full details: bhel.karexpert.com/order/my_orders_format/orderList_",
+                f"_Checked: {ist.strftime('%d %b %Y, %H:%M:%S')} IST_",
                 ""
             )
         else:
             slack(
-                f":calendar: *No upcoming appointments found.*\n\n"
-                f">  No bookings at this time.\n"
-                f">  Use `/check` to book a slot.\n\n"
+                f":calendar: *No upcoming appointments found*\n\n"
+                f">  No bookings at this time\n"
+                f">  Use `/check` to book a new slot\n\n"
                 f"_Checked: {ist.strftime('%d %b %Y, %H:%M:%S')} IST_",
                 ""
             )
@@ -662,19 +655,19 @@ def run():
 
     log(f"Bot V2 | Mode: {mode.upper()} | IST: {ist.strftime('%H:%M:%S')} | Target: {full_date}")
 
-    # Only show startup message for start/check modes — not orders
-    if mode != "orders":
-        mode_label = {
-            "start":  "Morning polling (6:50 AM – 7:30 AM)",
-            "check":  "Instant check + book",
-        }.get(mode, mode)
+    if mode == "start":
         slack(
-            f"*BHEL Bot started!* :rocket:\n"
-            f">  Mode:   *{mode_label}*\n"
+            f":rocket: *BHEL Bot started!*\n"
             f">  Doctor: *{DOCTOR_SEARCH}*\n"
-            f">  Date:   *{full_date}*\n"
-            f">  IST:    *{ist.strftime('%H:%M:%S')}*",
-            ":robot_face:"
+            f">  Target: *{full_date}*\n"
+            f">  Watching slots from *6:50 AM IST*\n"
+            f">  Auto-stop: *7:30 AM IST*",
+            ""
+        )
+    elif mode == "check":
+        slack(
+            f":mag: *Checking slots for {full_date}...*",
+            ""
         )
 
     with sync_playwright() as p:
@@ -686,8 +679,8 @@ def run():
         log("Logging in ...")
         do_login(page)
         ist = get_ist()
-        if mode != "orders":
-            slack(f":white_check_mark: *Logged in!* Navigating...", "")
+        if mode == "start":
+            slack(f":white_check_mark: *Logged in!* Watching for slots...", "")
 
         # Orders mode — go directly to orders, no doctor navigation needed
         if mode == "orders":
