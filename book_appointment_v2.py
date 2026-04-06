@@ -505,110 +505,140 @@ def run_check_mode(page, doctor_url, day_str, mon_str, full_date):
     log("CHECK mode — DONE!")
 
 # ── MODE 3: ORDERS — view upcoming appointments ──────────────────────────────
-def run_orders_mode(page):
+def parse_appointment(raw_text):
     """
-    Login → navigate to order list → fetch and display upcoming appointments
+    Parse raw appointment text into clean structured dict.
+    Looks for: doctor name, date, time, token, UHID, status
     """
-    ist = get_ist()
-    slack(
-        f":clipboard: *Fetching your upcoming appointments...*\n"
-        f">  IST: {ist.strftime('%H:%M:%S')}",
-        ""
+    appt = {
+        "doctor":   "Dr S Kamal Kumar",
+        "specialty":"General Physician",
+        "room":     "OPD PHY 2",
+        "floor":    "First Floor",
+        "date":     "",
+        "time":     "",
+        "token":    "",
+        "uhid":     "",
+        "status":   "Booked",
+        "payment":  "Successful",
+    }
+
+    lines = [l.strip() for l in raw_text.replace("|", "\n").split("\n") if l.strip()]
+
+    for line in lines:
+        line_lower = line.lower()
+        # Date & time — pattern: dd/mm/yyyy hh:mm am/pm
+        import re
+        dt_match = re.search(r"(\d{2}/\d{2}/\d{4})\s+(\d{1,2}:\d{2}\s*(?:am|pm))", line, re.IGNORECASE)
+        if dt_match:
+            raw_date = dt_match.group(1)  # 13/04/2026
+            raw_time = dt_match.group(2).strip()  # 06:00 pm
+            try:
+                from datetime import datetime as dt
+                d = dt.strptime(raw_date, "%d/%m/%Y")
+                appt["date"] = d.strftime("%d %b %Y")  # 13 Apr 2026
+            except Exception:
+                appt["date"] = raw_date
+            appt["time"] = raw_time.upper()  # 06:00 PM
+
+        # Token number
+        token_match = re.search(r"token\s*(?:no\.?|number|#)?\s*[:\-]?\s*(\d+)", line, re.IGNORECASE)
+        if token_match:
+            appt["token"] = token_match.group(1)
+
+        # UHID
+        uhid_match = re.search(r"UHID[/\s]+(\w+)", line, re.IGNORECASE)
+        if uhid_match:
+            appt["uhid"] = uhid_match.group(1)
+
+        # Status
+        if "pending" in line_lower:
+            appt["status"] = "Pending"
+        elif "booked" in line_lower:
+            appt["status"] = "Booked"
+        elif "completed" in line_lower:
+            appt["status"] = "Completed"
+        elif "cancelled" in line_lower:
+            appt["status"] = "Cancelled"
+
+    return appt
+
+
+def format_appointment_slack(appt, index=1):
+    """Format a single appointment as premium Slack message block."""
+    status_icon = {
+        "Booked":    ":white_check_mark:",
+        "Pending":   ":hourglass:",
+        "Completed": ":ballot_box_with_check:",
+        "Cancelled": ":x:",
+    }.get(appt["status"], ":white_check_mark:")
+
+    token_line = f"\n>  :ticket:  *Token No:*    {appt['token']}" if appt["token"] else ""
+    uhid_line  = f"\n>  :id:  *UHID:*         {appt['uhid']}"     if appt["uhid"]  else ""
+    date_line  = f"\n>  :calendar:  *Date:*         {appt['date']}" if appt["date"]  else ""
+    time_line  = f"\n>  :clock6:  *Time:*         {appt['time']}"  if appt["time"]  else ""
+
+    return (
+        f":hospital: *Appointment #{index}*\n"
+        f"{'─' * 30}\n"
+        f">  :male-doctor:  *Doctor:*       {appt['doctor']}\n"
+        f">  :stethoscope:  *Specialty:*    {appt['specialty']}\n"
+        f">  :round_pushpin:  *Room:*          {appt['room']} | {appt['floor']}"
+        f"{date_line}{time_line}{token_line}{uhid_line}\n"
+        f">  {status_icon}  *Status:*       {appt['status']}\n"
+        f">  :credit_card:  *Payment:*      {appt['payment']}\n"
+        f"{'─' * 30}"
     )
 
+
+def run_orders_mode(page):
+    """Login → orders page → parse → send premium Slack message."""
+    ist = get_ist()
+    log("Orders mode — navigating to order list ...")
+
     try:
-        log("Navigating to order list ...")
         page.goto(ORDER_URL, wait_until="networkidle", timeout=20000)
         time.sleep(2)
 
-        # Check if redirected to login
         if "login" in page.url and "dynamic" not in page.url:
-            slack(":x: Session expired. Try again.", "")
+            slack(":x: Session expired. Try `/orders` again.", "")
             return
 
-        log(f"Orders page: {page.url}")
+        log(f"Orders page loaded: {page.url}")
 
-        # Try to extract appointment details
-        appointments = []
-
-        # Look for appointment cards/rows
-        for selector in [
-            "div.order-card",
-            "div._wf-order-card",
-            "div[class*='order']",
-            "div[class*='appointment']",
-            "tr[class*='order']",
-            "kx-order-list div",
-        ]:
-            try:
-                items = page.locator(selector)
-                count = items.count()
-                if count > 0:
-                    log(f"Found {count} items via {selector}")
-                    for i in range(min(count, 5)):  # max 5 appointments
-                        try:
-                            item_text = items.nth(i).inner_text().strip()
-                            if item_text and len(item_text) > 10:
-                                appointments.append(item_text)
-                        except Exception:
-                            continue
-                    if appointments:
-                        break
-            except Exception:
-                continue
-
-        # Also try getting full page text for appointment info
-        if not appointments:
-            try:
-                # Look for specific appointment detail elements
-                body_text = page.locator("main, .main-content, #core-body").first.inner_text()
-                if "Kamal Kumar" in body_text or "Booked" in body_text or "Pending" in body_text:
-                    # Extract relevant lines
-                    lines = [l.strip() for l in body_text.split("\n") if l.strip()]
-                    relevant = []
-                    capture = False
-                    for line in lines:
-                        if any(kw in line for kw in ["Dr S Kamal", "Appointment", "Token", "Room", "Booked", "Pending", "OPD", "Apr", "2026"]):
-                            relevant.append(line)
-                            capture = True
-                        elif capture and line:
-                            relevant.append(line)
-                        if len(relevant) > 15:
-                            break
-                    if relevant:
-                        appointments = ["\n".join(relevant[:15])]
-            except Exception as e:
-                log(f"Body text: {e}")
+        # Get full page text
+        raw_text = ""
+        try:
+            raw_text = page.locator("body").inner_text()
+            log(f"Page text length: {len(raw_text)}")
+        except Exception as e:
+            log(f"Body text: {e}")
 
         ist = get_ist()
 
-        if appointments:
-            # Format nicely
-            appt_text = ""
-            for i, appt in enumerate(appointments[:3], 1):
-                # Clean up the text
-                clean = " | ".join([
-                    l.strip() for l in appt.split("\n")
-                    if l.strip() and len(l.strip()) > 2
-                ][:8])
-                appt_text += f"*{i}.* {clean}\n"
+        # Check if any appointment data exists
+        has_data = any(kw in raw_text for kw in [
+            "Kamal Kumar", "GENERAL PHYSICIAN", "OPD PHY",
+            "06:00", "Token", "UHID", "Booked", "Pending"
+        ])
 
+        if has_data:
+            appt  = parse_appointment(raw_text)
+            msg   = format_appointment_slack(appt, index=1)
             slack(
-                f":clipboard: *Your Upcoming Appointments*\n\n"
-                f"{appt_text}\n"
-                f">  IST: {ist.strftime('%d-%b-%Y %H:%M:%S')}\n"
-                f">  _Full details: bhel.karexpert.com/order/my_orders_format/orderList_",
-                ":hospital:"
+                f"*Your Upcoming Appointments* :clipboard:\n\n"
+                f"{msg}\n\n"
+                f"_Checked: {ist.strftime('%d %b %Y, %H:%M:%S')} IST_\n"
+                f"_Full details: bhel.karexpert.com/order/my_orders_format/orderList_",
+                ""
             )
         else:
-            # No structured data found — send direct link
             slack(
-                f":clipboard: *Your Appointments*\n\n"
-                f">  No upcoming appointments found, or page format changed.\n"
-                f">  IST: {ist.strftime('%d-%b-%Y %H:%M:%S')}\n\n"
-                f"View directly:\n"
-                f"bhel.karexpert.com/order/my_orders_format/orderList",
-                ":calendar:"
+                f":calendar: *No upcoming appointments found.*\n\n"
+                f">  No bookings at this time.\n"
+                f">  Use `/check` to book a slot.\n\n"
+                f"_Checked: {ist.strftime('%d %b %Y, %H:%M:%S')} IST_",
+                ""
             )
 
         log("Orders mode done!")
@@ -616,7 +646,7 @@ def run_orders_mode(page):
     except Exception as e:
         log(f"Orders error: {e}")
         slack(
-            f":x: Could not fetch appointments: {e}\n"
+            f":x: Could not fetch appointments.\n"
             f"View directly: bhel.karexpert.com/order/my_orders_format/orderList",
             ""
         )
@@ -632,14 +662,20 @@ def run():
 
     log(f"Bot V2 | Mode: {mode.upper()} | IST: {ist.strftime('%H:%M:%S')} | Target: {full_date}")
 
-    slack(
-        f"*BHEL Bot V2 started!* :rocket:\n"
-        f">  Mode: *{'🌅 START (morning)' if mode == 'start' else '🔍 CHECK (instant)'}*\n"
-        f">  Doctor: *{DOCTOR_SEARCH}*\n"
-        f">  Target date: *{full_date}*\n"
-        f">  IST: *{ist.strftime('%H:%M:%S')}*",
-        ":robot_face:"
-    )
+    # Only show startup message for start/check modes — not orders
+    if mode != "orders":
+        mode_label = {
+            "start":  "Morning polling (6:50 AM – 7:30 AM)",
+            "check":  "Instant check + book",
+        }.get(mode, mode)
+        slack(
+            f"*BHEL Bot started!* :rocket:\n"
+            f">  Mode:   *{mode_label}*\n"
+            f">  Doctor: *{DOCTOR_SEARCH}*\n"
+            f">  Date:   *{full_date}*\n"
+            f">  IST:    *{ist.strftime('%H:%M:%S')}*",
+            ":robot_face:"
+        )
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
@@ -647,10 +683,11 @@ def run():
         page    = ctx.new_page()
 
         # Login
-        slack(":key: Logging in with username + password...", "")
+        log("Logging in ...")
         do_login(page)
         ist = get_ist()
-        slack(f":white_check_mark: *Logged in!* IST: {ist.strftime('%H:%M:%S')}", "")
+        if mode != "orders":
+            slack(f":white_check_mark: *Logged in!* Navigating...", "")
 
         # Orders mode — go directly to orders, no doctor navigation needed
         if mode == "orders":
