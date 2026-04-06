@@ -504,6 +504,124 @@ def run_check_mode(page, doctor_url, day_str, mon_str, full_date):
     send_success_slack(date_label, chosen_time, confirmed)
     log("CHECK mode — DONE!")
 
+# ── MODE 3: ORDERS — view upcoming appointments ──────────────────────────────
+def run_orders_mode(page):
+    """
+    Login → navigate to order list → fetch and display upcoming appointments
+    """
+    ist = get_ist()
+    slack(
+        f":clipboard: *Fetching your upcoming appointments...*\n"
+        f">  IST: {ist.strftime('%H:%M:%S')}",
+        ""
+    )
+
+    try:
+        log("Navigating to order list ...")
+        page.goto(ORDER_URL, wait_until="networkidle", timeout=20000)
+        time.sleep(2)
+
+        # Check if redirected to login
+        if "login" in page.url and "dynamic" not in page.url:
+            slack(":x: Session expired. Try again.", "")
+            return
+
+        log(f"Orders page: {page.url}")
+
+        # Try to extract appointment details
+        appointments = []
+
+        # Look for appointment cards/rows
+        for selector in [
+            "div.order-card",
+            "div._wf-order-card",
+            "div[class*='order']",
+            "div[class*='appointment']",
+            "tr[class*='order']",
+            "kx-order-list div",
+        ]:
+            try:
+                items = page.locator(selector)
+                count = items.count()
+                if count > 0:
+                    log(f"Found {count} items via {selector}")
+                    for i in range(min(count, 5)):  # max 5 appointments
+                        try:
+                            item_text = items.nth(i).inner_text().strip()
+                            if item_text and len(item_text) > 10:
+                                appointments.append(item_text)
+                        except Exception:
+                            continue
+                    if appointments:
+                        break
+            except Exception:
+                continue
+
+        # Also try getting full page text for appointment info
+        if not appointments:
+            try:
+                # Look for specific appointment detail elements
+                body_text = page.locator("main, .main-content, #core-body").first.inner_text()
+                if "Kamal Kumar" in body_text or "Booked" in body_text or "Pending" in body_text:
+                    # Extract relevant lines
+                    lines = [l.strip() for l in body_text.split("\n") if l.strip()]
+                    relevant = []
+                    capture = False
+                    for line in lines:
+                        if any(kw in line for kw in ["Dr S Kamal", "Appointment", "Token", "Room", "Booked", "Pending", "OPD", "Apr", "2026"]):
+                            relevant.append(line)
+                            capture = True
+                        elif capture and line:
+                            relevant.append(line)
+                        if len(relevant) > 15:
+                            break
+                    if relevant:
+                        appointments = ["\n".join(relevant[:15])]
+            except Exception as e:
+                log(f"Body text: {e}")
+
+        ist = get_ist()
+
+        if appointments:
+            # Format nicely
+            appt_text = ""
+            for i, appt in enumerate(appointments[:3], 1):
+                # Clean up the text
+                clean = " | ".join([
+                    l.strip() for l in appt.split("\n")
+                    if l.strip() and len(l.strip()) > 2
+                ][:8])
+                appt_text += f"*{i}.* {clean}\n"
+
+            slack(
+                f":clipboard: *Your Upcoming Appointments*\n\n"
+                f"{appt_text}\n"
+                f">  IST: {ist.strftime('%d-%b-%Y %H:%M:%S')}\n"
+                f">  _Full details: bhel.karexpert.com/order/my_orders_format/orderList_",
+                ":hospital:"
+            )
+        else:
+            # No structured data found — send direct link
+            slack(
+                f":clipboard: *Your Appointments*\n\n"
+                f">  No upcoming appointments found, or page format changed.\n"
+                f">  IST: {ist.strftime('%d-%b-%Y %H:%M:%S')}\n\n"
+                f"View directly:\n"
+                f"bhel.karexpert.com/order/my_orders_format/orderList",
+                ":calendar:"
+            )
+
+        log("Orders mode done!")
+
+    except Exception as e:
+        log(f"Orders error: {e}")
+        slack(
+            f":x: Could not fetch appointments: {e}\n"
+            f"View directly: bhel.karexpert.com/order/my_orders_format/orderList",
+            ""
+        )
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 def run():
     from playwright.sync_api import sync_playwright
@@ -534,15 +652,18 @@ def run():
         ist = get_ist()
         slack(f":white_check_mark: *Logged in!* IST: {ist.strftime('%H:%M:%S')}", "")
 
-        # Navigate to doctor
-        doctor_url = navigate_to_doctor(page)
-        log(f"Doctor page: {doctor_url}")
-
-        # Run selected mode
-        if mode == "check":
-            run_check_mode(page, doctor_url, day_str, mon_str, full_date)
+        # Orders mode — go directly to orders, no doctor navigation needed
+        if mode == "orders":
+            run_orders_mode(page)
         else:
-            run_start_mode(page, doctor_url, day_str, mon_str, full_date)
+            # Navigate to doctor for check/start modes
+            doctor_url = navigate_to_doctor(page)
+            log(f"Doctor page: {doctor_url}")
+
+            if mode == "check":
+                run_check_mode(page, doctor_url, day_str, mon_str, full_date)
+            else:
+                run_start_mode(page, doctor_url, day_str, mon_str, full_date)
 
         browser.close()
         log("Done.")
